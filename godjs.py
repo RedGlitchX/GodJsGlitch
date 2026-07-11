@@ -911,6 +911,96 @@ def _t_mani():
         "https://x.com/_next/static/x/_buildManifest.js"))
 
 
+# ----------------------------------------------------------------------------
+# SECTION: HTML script extraction + recursive JS-in-JS link discovery
+# ----------------------------------------------------------------------------
+_SCRIPT_SRC_RE = re.compile(r"<script[^>]+\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_LINK_RE = re.compile(r"<link\b[^>]*>", re.I)
+_HREF_RE = re.compile(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_REL_RE = re.compile(r"\brel\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_AS_RE = re.compile(r"\bas\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_IMPORTMAP_RE = re.compile(
+    r"<script[^>]+type\s*=\s*[\"']importmap[\"'][^>]*>(.*?)</script>", re.I | re.S)
+_IMPORT_FROM_RE = re.compile(r"import\s+(?:[^'\"]+?\s+from\s+)?[\"']([^\"']+)[\"']", re.I)
+_A_HREF_RE = re.compile(r"<a\b[^>]*\bhref\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_JS_STR_RE = re.compile(r"[\"']([^\"'\s]+\.m?js)(?:[\"'?#])")
+_DYN_IMPORT_RE = re.compile(r"import\(\s*[\"']([^\"']+)[\"']\s*\)")
+
+
+def extract_scripts_from_html(html: str, base: str) -> "set[str]":
+    """Extract JS URLs from HTML: <script src>, module/preload links, importmap, imports."""
+    out: "set[str]" = set()
+    for m in _SCRIPT_SRC_RE.finditer(html):
+        out.add(canonicalize_url(m.group(1), base))
+    for tag in _LINK_RE.finditer(html):
+        t = tag.group(0)
+        hm = _HREF_RE.search(t)
+        if not hm:
+            continue
+        hv = hm.group(1)
+        rel = (_REL_RE.search(t).group(1).lower() if _REL_RE.search(t) else "")
+        asv = (_AS_RE.search(t).group(1).lower() if _AS_RE.search(t) else "")
+        if ("modulepreload" in rel
+                or (("preload" in rel or "prefetch" in rel) and asv == "script")
+                or looks_like_js_url(hv)):
+            out.add(canonicalize_url(hv, base))
+    for im in _IMPORTMAP_RE.finditer(html):
+        try:
+            data = json.loads(im.group(1))
+            for v in (data.get("imports") or {}).values():
+                if isinstance(v, str):
+                    out.add(canonicalize_url(v, base))
+            for scope in (data.get("scopes") or {}).values():
+                if isinstance(scope, dict):
+                    for v in scope.values():
+                        if isinstance(v, str):
+                            out.add(canonicalize_url(v, base))
+        except Exception:
+            pass
+    for m in _IMPORT_FROM_RE.finditer(html):
+        spec = m.group(1)
+        if looks_like_js_url(spec) or spec.startswith((".", "/")):
+            out.add(canonicalize_url(spec, base))
+    return out
+
+
+def extract_html_links(html: str, base: str) -> "set[str]":
+    """Extract same-doc <a href> links for the crawl frontier."""
+    out: "set[str]" = set()
+    for m in _A_HREF_RE.finditer(html):
+        h = m.group(1)
+        if h.startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+            continue
+        out.add(canonicalize_url(h, base))
+    return out
+
+
+def extract_js_links(js_text: str, base: str) -> "set[str]":
+    """Extract .js references and dynamic import() targets from inside a JS file."""
+    out: "set[str]" = set()
+    for m in _JS_STR_RE.finditer(js_text):
+        out.add(canonicalize_url(m.group(1), base))
+    for m in _DYN_IMPORT_RE.finditer(js_text):
+        out.add(canonicalize_url(m.group(1), base))
+    return out
+
+
+@selftest("html.script_extraction")
+def _t_html():
+    html = ('<script src="/a.js"></script><link rel="modulepreload" href="/b.js">'
+            '<script type="importmap">{"imports":{"x":"/c.js"}}</script><a href="/page2">')
+    s = extract_scripts_from_html(html, "https://x.com/")
+    assert {"https://x.com/a.js", "https://x.com/b.js", "https://x.com/c.js"} <= s, s
+    assert "https://x.com/page2" in extract_html_links(html, "https://x.com/")
+
+
+@selftest("jsinjs.links")
+def _t_jsinjs():
+    js = 'fetch("/api/x");var u="/static/lazy.js";import("/static/dyn.js")'
+    s = extract_js_links(js, "https://x.com/app.js")
+    assert "https://x.com/static/lazy.js" in s and "https://x.com/static/dyn.js" in s, s
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
