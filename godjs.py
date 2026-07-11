@@ -1585,6 +1585,159 @@ def _t_valoff():
     assert r3["status"] == "unverified", r3
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Reporters (js_urls.txt, results.json, self-contained report.html)
+# ----------------------------------------------------------------------------
+@dataclass
+class RunState:
+    domain: str
+    records: "list[FileRecord]"
+    coverage: dict
+    findings: dict
+    json_only: bool = False
+
+
+def _esc(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _record_to_dict(r: FileRecord) -> dict:
+    d = asdict(r)
+    d["sources"] = sorted(r.sources) if isinstance(r.sources, set) else list(r.sources or [])
+    d.pop("text", None)  # never dump full file bodies into the report
+    return d
+
+
+def write_urls_txt(records: "list[FileRecord]", path) -> None:
+    urls = sorted({r.url for r in records})
+    Path(path).write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
+
+
+def write_results_json(state: RunState, path) -> None:
+    recs = sorted(state.records, key=lambda r: (-r.score, r.url))
+    data = {
+        "domain": state.domain,
+        "coverage": state.coverage,
+        "findings": state.findings,
+        "count": len(recs),
+        "records": [_record_to_dict(r) for r in recs],
+    }
+    Path(path).write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+
+_SEV_COLOR = {"critical": "#e5484d", "high": "#f76808", "medium": "#ffb224",
+              "low": "#8f8f8f", "decoded": "#3e63dd", "valid": "#e5484d",
+              "invalid": "#4c9a4c", "found": "#e5484d", "unverified": "#8f8f8f"}
+
+
+def render_html(state: RunState) -> str:
+    recs = sorted(state.records, key=lambda r: (-r.score, r.url))
+    total = len(recs)
+    with_secrets = sum(1 for r in recs if r.secrets)
+    cov = state.coverage or {}
+    rows = []
+    for r in recs:
+        sev_chips = "".join(
+            f'<span class="chip" style="background:{_SEV_COLOR.get(s.get("severity","low") if isinstance(s,dict) else getattr(s,"severity","low"),"#8f8f8f")}">'
+            f'{_esc(s.get("type") if isinstance(s,dict) else getattr(s,"type",""))}</span>'
+            for s in (r.secrets or []))
+        secret_detail = "".join(
+            f"<div class='mono'>{_esc((s.get('type') if isinstance(s,dict) else getattr(s,'type','')))}: "
+            f"{_esc((s.get('match') if isinstance(s,dict) else getattr(s,'match','')))}</div>"
+            for s in (r.secrets or []))
+        ep_detail = "".join(f"<div class='mono'>{_esc(e)}</div>" for e in (r.endpoints or [])[:60])
+        rev_detail = "".join(f"<div class='mono'>{_esc(p)}</div>" for p in (r.revealed_sources or [])[:60])
+        val_detail = "".join(
+            f"<div class='mono'>{_esc(v.get('type'))} = <b style='color:{_SEV_COLOR.get(v.get('status'),'#8f8f8f')}'>"
+            f"{_esc(v.get('status'))}</b> ({_esc(v.get('detail'))})</div>"
+            for v in (r.validated or []))
+        details = ""
+        if secret_detail or ep_detail or rev_detail or val_detail:
+            details = (f"<tr class='detail'><td colspan='6'>"
+                       f"{'<h4>Secrets</h4>'+secret_detail if secret_detail else ''}"
+                       f"{'<h4>Validation</h4>'+val_detail if val_detail else ''}"
+                       f"{'<h4>Revealed sources</h4>'+rev_detail if rev_detail else ''}"
+                       f"{'<h4>Endpoints</h4>'+ep_detail if ep_detail else ''}"
+                       f"</td></tr>")
+        sm = "map" if r.sourcemap_url else ""
+        rows.append(
+            f"<tr><td class='score'>{r.score:g}</td>"
+            f"<td class='url'><a href='{_esc(r.url)}' target='_blank' rel='noopener'>{_esc(r.url)}</a><br>{sev_chips}</td>"
+            f"<td>{r.bytes or 0}</td><td>{_esc(','.join(sorted(r.sources)) if isinstance(r.sources,set) else '')}</td>"
+            f"<td>{len(r.endpoints or [])}</td><td>{sm}</td></tr>{details}")
+    cov_items = "".join(f"<li><b>{_esc(k)}</b>: {_esc(v)}</li>" for k, v in cov.items())
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GodJS report - {_esc(state.domain)}</title>
+<style>
+:root{{color-scheme:light dark}}
+body{{font-family:system-ui,Segoe UI,Roboto,sans-serif;margin:0;background:#0d0d10;color:#e8e8ea}}
+header{{padding:20px 24px;background:#15151a;border-bottom:1px solid #2a2a33}}
+h1{{margin:0;font-size:20px}} .sub{{color:#9a9aa5;font-size:13px;margin-top:4px}}
+.wrap{{padding:20px 24px}}
+.stats{{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}}
+.stat{{background:#15151a;border:1px solid #2a2a33;border-radius:10px;padding:12px 16px;min-width:120px}}
+.stat b{{font-size:22px;display:block}}
+ul.cov{{list-style:none;padding:0;margin:0;columns:2;font-size:13px;color:#c7c7cf}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid #23232b;vertical-align:top}}
+th{{position:sticky;top:0;background:#15151a;color:#9a9aa5;font-weight:600}}
+td.score{{font-weight:700;color:#ffb224}} td.url{{word-break:break-all;max-width:640px}}
+a{{color:#7aa2ff;text-decoration:none}}
+.chip{{display:inline-block;color:#111;font-size:10px;font-weight:700;padding:1px 6px;border-radius:6px;margin:2px 3px 0 0}}
+.mono{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#c7c7cf;word-break:break-all}}
+tr.detail td{{background:#101015;border-bottom:2px solid #23232b}}
+h4{{margin:10px 0 4px;font-size:12px;color:#9a9aa5;text-transform:uppercase;letter-spacing:.5px}}
+.tablewrap{{overflow-x:auto}}
+@media (prefers-color-scheme:light){{body{{background:#fff;color:#111}}header,.stat,th{{background:#f6f6f8}}header{{border-color:#e3e3e8}}}}
+</style></head>
+<body>
+<header><h1>GodJS &mdash; {_esc(state.domain)}</h1>
+<div class="sub">{total} unique JS files &middot; {with_secrets} with secret candidates &middot; ranked by juice score</div></header>
+<div class="wrap">
+<div class="stats">
+<div class="stat"><b>{total}</b>JS files</div>
+<div class="stat"><b>{with_secrets}</b>with secrets</div>
+<div class="stat"><b>{sum(len(r.endpoints or []) for r in recs)}</b>endpoints</div>
+<div class="stat"><b>{sum(1 for r in recs if r.sourcemap_url)}</b>source maps</div>
+</div>
+<h4>Coverage</h4><ul class="cov">{cov_items}</ul>
+<div class="tablewrap"><table>
+<thead><tr><th>Score</th><th>URL / secrets</th><th>Bytes</th><th>Source</th><th>Endpoints</th><th>Map</th></tr></thead>
+<tbody>{''.join(rows)}</tbody>
+</table></div>
+</div></body></html>"""
+
+
+def write_all(state: RunState, outdir) -> None:
+    out = Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    write_urls_txt(state.records, out / "js_urls.txt")
+    write_results_json(state, out / "results.json")
+    if not state.json_only:
+        (out / "report.html").write_text(render_html(state), encoding="utf-8")
+
+
+@selftest("report.writers")
+def _t_rep():
+    import tempfile
+    recs = [
+        FileRecord("https://x.com/b.js", {"crawl"}, 200, "application/javascript", 10, "h1", True, ""),
+        FileRecord("https://x.com/a.js", {"wayback"}, 200, "application/javascript", 10, "h2", True, ""),
+    ]
+    d = tempfile.mkdtemp()
+    st = RunState("x.com", recs, {"total": 2}, {})
+    write_all(st, d)
+    lines = Path(d, "js_urls.txt").read_text().split()
+    assert lines == sorted(lines) and len(lines) == 2, lines
+    j = json.loads(Path(d, "results.json").read_text())
+    assert j["coverage"]["total"] == 2 and j["count"] == 2
+    html = render_html(st)
+    assert "<html" in html.lower() and "x.com" in html
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
