@@ -1147,6 +1147,99 @@ def _t_src():
     assert "x.com" in parse_crtsh('[{"name_value":"*.x.com"}]')
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Spider (active, level-batched concurrent depth-N crawl)
+# ----------------------------------------------------------------------------
+_ASSET_EXT_RE = re.compile(
+    r"\.(css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|pdf|zip|gz|mp4|webm|mp3|"
+    r"js|mjs|cjs|json|xml|map|txt|wasm|avif)(\?|#|$)", re.I)
+
+
+def _is_page(url: str) -> bool:
+    """True if the URL looks like an HTML page (not a static asset)."""
+    return not _ASSET_EXT_RE.search(urllib.parse.urlsplit(url).path)
+
+
+class Spider:
+    """Async, scope-guarded, level-batched HTML crawler."""
+
+    def __init__(self, engine: HttpEngine, scope: Scope, cfg: Config):
+        self.engine = engine
+        self.scope = scope
+        self.cfg = cfg
+
+    async def crawl(self, seeds: "list[str]"):
+        js_urls: "set[str]" = set()
+        html_records: "list[FileRecord]" = []
+        visited: "set[str]" = set()
+        frontier = [canonicalize_url(u) for u in seeds]
+        pages = 0
+        for depth in range(self.cfg.depth + 1):
+            if not frontier or pages >= self.cfg.max_pages:
+                break
+            batch = []
+            for u in frontier:
+                if u in visited or not self.scope.in_scope(u):
+                    continue
+                visited.add(u)
+                batch.append(u)
+                if len(batch) + pages >= self.cfg.max_pages:
+                    break
+            if not batch:
+                break
+            results = await asyncio.gather(*[self.engine.get(u) for u in batch],
+                                           return_exceptions=True)
+            next_frontier: "list[str]" = []
+            for u, r in zip(batch, results):
+                if isinstance(r, Exception) or r.error or r.status != 200:
+                    continue
+                pages += 1
+                text = r.text or ""
+                for j in extract_scripts_from_html(text, u):
+                    if self.scope.in_scope(j):
+                        js_urls.add(j)
+                for j in extract_js_links(text, u):
+                    if looks_like_js_url(j) and self.scope.in_scope(j):
+                        js_urls.add(j)
+                ctype = _header(r.headers, "content-type")
+                if "html" in ctype.lower() or "<" in text[:200]:
+                    body = r.content or text.encode("utf-8", "replace")
+                    html_records.append(FileRecord(
+                        u, {"crawl"}, r.status, ctype, len(body),
+                        hashlib.sha256(body).hexdigest(), False, text))
+                    if depth < self.cfg.depth:
+                        for link in extract_html_links(text, u):
+                            if (link not in visited and self.scope.in_scope(link)
+                                    and _is_page(link)):
+                                next_frontier.append(link)
+            frontier = next_frontier
+        return js_urls, html_records
+
+
+@selftest("spider.depth_crawl")
+def _t_spider():
+    base, stop = _serve({
+        "/": ("text/html", b'<script src="/app.js"></script><a href="/page2">go</a>'),
+        "/page2": ("text/html", b'<script src="/admin.js"></script>'),
+        "/app.js": ("application/javascript", b"1"),
+        "/admin.js": ("application/javascript", b"2"),
+    })
+
+    async def go():
+        sc = Scope(_host(base), allow_subs=True)
+        sp = Spider(HttpEngine(Config.defaults()), sc, Config.defaults())
+        js, _ = await sp.crawl([base + "/"])
+        await sp.engine.close()
+        return js
+
+    try:
+        js = _run(go())
+        assert any(u.endswith("/app.js") for u in js), js
+        assert any(u.endswith("/admin.js") for u in js), js  # found only via depth-1 crawl
+    finally:
+        stop()
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
