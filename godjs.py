@@ -1240,6 +1240,195 @@ def _t_spider():
         stop()
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Analysis - secrets, endpoints, entropy, JWT, juice score
+# ----------------------------------------------------------------------------
+@dataclass
+class Secret:
+    type: str
+    match: str
+    entropy: float
+    severity: str
+
+
+# (name, compiled regex capturing the token in group(1), severity)
+_SECRET_PATTERNS = [
+    ("aws_access_key_id", re.compile(r"\b(AKIA[0-9A-Z]{16})\b"), "high"),
+    ("aws_sts_key", re.compile(r"\b(ASIA[0-9A-Z]{16})\b"), "high"),
+    ("gcp_api_key", re.compile(r"\b(AIza[0-9A-Za-z\-_]{35})\b"), "medium"),
+    ("stripe_secret_key", re.compile(r"\b(sk_live_[0-9a-zA-Z]{24,})"), "critical"),
+    ("stripe_restricted_key", re.compile(r"\b(rk_live_[0-9a-zA-Z]{24,})"), "high"),
+    ("github_pat", re.compile(r"\b(ghp_[A-Za-z0-9]{36})\b"), "high"),
+    ("github_fine_grained_pat", re.compile(r"\b(github_pat_[A-Za-z0-9_]{82})\b"), "high"),
+    ("github_oauth", re.compile(r"\b(gh[ousr]_[A-Za-z0-9]{36})\b"), "high"),
+    ("gitlab_pat", re.compile(r"\b(glpat-[A-Za-z0-9\-_]{20})\b"), "high"),
+    ("slack_token", re.compile(r"\b(xox[abprs]-[0-9A-Za-z-]{10,})"), "high"),
+    ("slack_webhook", re.compile(
+        r"(https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+)"), "high"),
+    ("discord_webhook", re.compile(
+        r"(https://discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_\-]+)"), "medium"),
+    ("google_oauth_refresh", re.compile(r"\b(1//0[A-Za-z0-9\-_]{40,})"), "high"),
+    ("twilio_account_sid", re.compile(r"\b(AC[a-f0-9]{32})\b"), "medium"),
+    ("sendgrid_key", re.compile(r"\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})\b"), "high"),
+    ("mailgun_key", re.compile(r"\b(key-[a-f0-9]{32})\b"), "medium"),
+    ("npm_token", re.compile(r"\b(npm_[A-Za-z0-9]{36})\b"), "high"),
+    ("square_token", re.compile(r"\b(EAAA[A-Za-z0-9\-_]{60,})"), "high"),
+    ("paypal_token", re.compile(r"(access_token\$production\$[A-Za-z0-9]+\$[a-f0-9]+)"), "high"),
+    ("openai_key", re.compile(r"\b(sk-(?:proj-)?[A-Za-z0-9]{20,})"), "high"),
+    ("anthropic_key", re.compile(r"\b(sk-ant-[A-Za-z0-9_\-]{20,})"), "high"),
+    ("huggingface_token", re.compile(r"\b(hf_[A-Za-z0-9]{30,})"), "high"),
+    ("digitalocean_token", re.compile(r"\b(dop_v1_[a-f0-9]{64})\b"), "high"),
+    ("mapbox_secret", re.compile(r"\b(sk\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)"), "high"),
+    ("azure_storage_conn", re.compile(
+        r"(DefaultEndpointsProtocol=https?;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{20,})"),
+     "critical"),
+    ("private_key", re.compile(
+        r"(-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----)"), "critical"),
+    ("jwt", re.compile(r"\b(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)"), "medium"),
+    ("mongodb_uri", re.compile(r"(mongodb(?:\+srv)?://[^\s\"'<>]+)"), "high"),
+    ("postgres_uri", re.compile(
+        r"(postgres(?:ql)?://[^\s\"'<>:]+:[^\s\"'<>@]+@[^\s\"'<>]+)"), "high"),
+    ("mysql_uri", re.compile(r"(mysql://[^\s\"'<>:]+:[^\s\"'<>@]+@[^\s\"'<>]+)"), "high"),
+    ("redis_uri", re.compile(r"(redis://[^\s\"'<>:]*:[^\s\"'<>@]+@[^\s\"'<>]+)"), "medium"),
+    ("amqp_uri", re.compile(r"(amqp://[^\s\"'<>:]+:[^\s\"'<>@]+@[^\s\"'<>]+)"), "medium"),
+    ("basic_auth_header", re.compile(r"(Authorization:\s*Basic\s+[A-Za-z0-9+/=]{8,})"), "medium"),
+    ("bearer_token", re.compile(r"(Authorization:\s*Bearer\s+[A-Za-z0-9._\-]{12,})"), "medium"),
+    ("firebase_endpoint", re.compile(r"([a-z0-9\-]+\.firebaseio\.com)"), "low"),
+    ("google_service_account", re.compile(r'("type"\s*:\s*"service_account")'), "high"),
+]
+
+_GENERIC_SECRET_RE = re.compile(
+    r"(?i)\b(api[_-]?key|secret|token|password|passwd|client[_-]?secret|access[_-]?key|"
+    r"auth[_-]?token|private[_-]?key|signing[_-]?key|jwt[_-]?secret|app[_-]?secret|"
+    r"webhook[_-]?secret|cookie[_-]?secret)\b\s*[:=]\s*[\"']([^\"']{8,})[\"']")
+
+_PLACEHOLDER_RE = re.compile(
+    r"(?i)(your[_-]?|changeme|placeholder|example|xxxx+|<[^>]+>|\.\.\.|"
+    r"test[_-]?key|dummy|sample|redacted|insert[_-]?here|process\.env)")
+
+_ABS_URL_RE = re.compile(r"https?://[A-Za-z0-9.\-]+(?:/[A-Za-z0-9_\-./?=&%~+]*)?")
+_QUOTED_PATH_RE = re.compile(r"[\"'`](/[A-Za-z0-9_][A-Za-z0-9_\-/.]{1,})[\"'`?#]")
+
+
+def shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    freq: dict = {}
+    for ch in s:
+        freq[ch] = freq.get(ch, 0) + 1
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in freq.values())
+
+
+def decode_jwt(tok: str) -> "Optional[dict]":
+    """Decode a JWT's header + payload (no signature verification)."""
+    try:
+        parts = tok.split(".")
+        if len(parts) < 2:
+            return None
+
+        def b64(seg: str):
+            seg += "=" * (-len(seg) % 4)
+            return json.loads(base64.urlsafe_b64decode(seg).decode("utf-8", "replace"))
+
+        return {"header": b64(parts[0]), "payload": b64(parts[1])}
+    except Exception:
+        return None
+
+
+def scan_secrets(text: str) -> "list[Secret]":
+    """Extract secrets: prefixed high-confidence patterns + entropy-gated generics."""
+    found: "list[Secret]" = []
+    seen: set = set()
+    for name, rx, sev in _SECRET_PATTERNS:
+        for m in rx.finditer(text):
+            val = m.group(1)
+            key = (name, val)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(Secret(name, val[:160], round(shannon_entropy(val), 2), sev))
+    for m in _GENERIC_SECRET_RE.finditer(text):
+        val = m.group(2)
+        if _PLACEHOLDER_RE.search(val):
+            continue
+        ent = shannon_entropy(val)
+        if ent < 3.5:
+            continue
+        key = ("generic_secret", val)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(Secret("generic_secret", val[:160], round(ent, 2), "medium"))
+    return found
+
+
+def scan_endpoints(text: str) -> "list[str]":
+    """LinkFinder-style extraction of absolute URLs + quoted paths."""
+    out: "list[str]" = []
+    seen: set = set()
+    for m in _ABS_URL_RE.finditer(text):
+        p = m.group(0).rstrip("\\\"'")
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    for m in _QUOTED_PATH_RE.finditer(text):
+        p = m.group(1)
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out[:2000]
+
+
+_ADMIN_ENDPOINT_RE = re.compile(
+    r"admin|internal|debug|actuator|management|_next|graphql|billing|payment|"
+    r"secret|token|export|upload", re.I)
+
+
+def score_record(rec: FileRecord, secrets: "list[Secret]", endpoints: "list[str]") -> float:
+    """Compute a juice score used to rank which file to read first."""
+    sev_w = {"critical": 40.0, "high": 25.0, "medium": 12.0, "low": 4.0}
+    score = 0.0
+    for s in secrets:
+        score += sev_w.get(s.severity, 8.0)
+    score += 3.0 * sum(1 for e in endpoints if _ADMIN_ENDPOINT_RE.search(e))
+    score += 0.1 * len(endpoints)
+    if rec.revealed_sources:
+        score += 5.0
+    if rec.sourcemap_url:
+        score += 3.0
+    if rec.bytes and rec.bytes < 2000:
+        score += 1.0
+    if re.search(r"admin|config|env|secret|internal|debug", rec.url, re.I):
+        score += 5.0
+    return round(score, 2)
+
+
+@selftest("analyze.secrets_endpoints_score")
+def _t_an():
+    txt = ('AKIAIOSFODNN7EXAMPLE k="sk_live_' + "a" * 24 + '" '
+           'url="/api/v1/admin" x="lowentropydecoy"')
+    types = {s.type for s in scan_secrets(txt)}
+    assert "aws_access_key_id" in types, types
+    assert any("stripe" in t for t in types), types
+    assert "/api/v1/admin" in scan_endpoints(txt)
+    assert shannon_entropy("aaaaaaaa") < shannon_entropy("aB3$xY9!zQ")
+    hi = score_record(FileRecord("u", set(), 200, "application/javascript", 100, "h", True, txt),
+                      scan_secrets(txt), scan_endpoints(txt))
+    lo = score_record(FileRecord("u2", set(), 200, "application/javascript", 100, "h2", True, "benign"),
+                      [], [])
+    assert hi > lo, (hi, lo)
+
+
+@selftest("analyze.jwt_decode")
+def _t_jwt():
+    # {"alg":"none"} . {"role":"admin"}
+    h = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
+    p = base64.urlsafe_b64encode(b'{"role":"admin"}').decode().rstrip("=")
+    dec = decode_jwt(f"{h}.{p}.")
+    assert dec and dec["payload"]["role"] == "admin" and dec["header"]["alg"] == "none"
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
