@@ -261,14 +261,21 @@ def apex_of(host: str) -> str:
 
 @dataclass
 class Scope:
-    """Apex-scoped guardrail: decides whether a URL is in-scope."""
+    """Apex-scoped guardrail: decides whether a URL is in-scope.
+
+    If `allow_hosts` is non-empty (e.g. from --scope FILE) it takes precedence:
+    a URL is in scope only if its host equals or is a subdomain of a listed host.
+    Otherwise the apex + allow_subs logic applies.
+    """
     apex: str
     allow_subs: bool = True
     oos: set = field(default_factory=set)
+    allow_hosts: set = field(default_factory=set)
 
     def __post_init__(self):
         self.apex = apex_of(self.apex)
         self.oos = {h.lower() for h in self.oos}
+        self.allow_hosts = {h.lower().lstrip("*.") for h in self.allow_hosts}
 
     def add_oos(self, host: str) -> None:
         self.oos.add(host.lower())
@@ -277,6 +284,8 @@ class Scope:
         host = _host(url).lower()
         if not host or host in self.oos:
             return False
+        if self.allow_hosts:
+            return any(host == h or host.endswith("." + h) for h in self.allow_hosts)
         if host == self.apex:
             return True
         if self.allow_subs and host.endswith("." + self.apex):
@@ -1794,6 +1803,222 @@ def _t_bridge():
         "https://x.com/a.js", "https://x.com/b.js"}
     # this machine has no Go tools -> augment returns empty and never raises
     assert _run(bridge_augment("example.com", Scope("example.com"))) == set()
+
+
+# ----------------------------------------------------------------------------
+# SECTION: Orchestrator - recursive fixpoint discovery pipeline
+# ----------------------------------------------------------------------------
+def _is_local_host(host: str) -> bool:
+    host = (host or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    if _IP_RE.match(host):
+        return (host.startswith(("127.", "10.", "192.168.", "169.254."))
+                or host.startswith("172."))
+    return False
+
+
+def _safe_child_path(root: Path, rel: str) -> Path:
+    """Resolve rel under root, refusing traversal outside root."""
+    rel = rel.replace("webpack://", "").lstrip("/")
+    parts = [p for p in re.split(r"[\\/]+", rel) if p not in ("", ".", "..")]
+    target = (root / "/".join(parts)).resolve()
+    if not str(target).startswith(str(root.resolve())):
+        return root / (hashlib.sha1(rel.encode()).hexdigest() + ".txt")
+    return target
+
+
+class Orchestrator:
+    """Wires all techniques into one recursive, scope-guarded, capped pipeline."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def _build_scope(self) -> Scope:
+        cfg = self.cfg
+        allow_hosts: set = set()
+        if cfg.scope_file and Path(cfg.scope_file).exists():
+            for line in Path(cfg.scope_file).read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    allow_hosts.add(line)
+        return Scope(cfg.domain, allow_subs=cfg.allow_subs, allow_hosts=allow_hosts)
+
+    async def run(self) -> RunState:
+        cfg = self.cfg
+        scope = self._build_scope()
+        engine = HttpEngine(cfg)
+        prober = Prober(engine)
+        coverage: dict = {"providers": {}, "techniques": {}}
+        candidates: "set[str]" = set()
+        subdomains: "set[str]" = set()
+        local = _is_local_host(apex_of(cfg.domain))
+
+        # --- 1. Passive archives (skipped for local/IP targets) ---
+        if not local:
+            provs = [("wayback", source_wayback), ("otx", source_otx),
+                     ("urlscan", source_urlscan), ("commoncrawl", source_commoncrawl)]
+            results = await asyncio.gather(*[f(engine, cfg.domain) for _, f in provs],
+                                           return_exceptions=True)
+            for (name, _), res in zip(provs, results):
+                got = res if isinstance(res, set) else set()
+                coverage["providers"][name] = len(got)
+                candidates |= {u for u in got if scope.in_scope(u)}
+            try:
+                subs = await source_crtsh(engine, cfg.domain)
+            except Exception:
+                subs = set()
+            subdomains = {s for s in subs if scope.in_scope("https://" + s + "/")}
+            coverage["providers"]["crtsh_subdomains"] = len(subdomains)
+
+        # --- 2. Seeds + active crawl ---
+        seeds = list(cfg.seeds) if cfg.seeds else [
+            f"https://{cfg.domain}/", f"http://{cfg.domain}/"]
+        if cfg.allow_subs and not cfg.passive:
+            seeds += ["https://" + s + "/" for s in list(subdomains)[:50]]
+        if not cfg.passive:
+            spider = Spider(engine, scope, cfg)
+            js_from_crawl, html_records = await spider.crawl(seeds)
+            candidates |= {u for u in js_from_crawl if scope.in_scope(u)}
+            coverage["techniques"]["crawl_js"] = len(js_from_crawl)
+            coverage["techniques"]["html_pages_crawled"] = len(html_records)
+
+        # --- 3. Opportunistic Go-tool bridge ---
+        try:
+            bridged = set() if local else await bridge_augment(cfg.domain, scope)
+        except Exception:
+            bridged = set()
+        candidates |= bridged
+        coverage["techniques"]["bridge_js"] = len(bridged)
+
+        # --- 4. Recursive probe + extract to a fixpoint ---
+        records: "list[FileRecord]" = []
+        probed: "set[str]" = set()
+        queue = {u for u in candidates if scope.in_scope(u)}
+        iterations = 0
+        while queue and len(probed) < cfg.max_urls and iterations < 6:
+            iterations += 1
+            batch = [u for u in queue if u not in probed][:cfg.max_urls - len(probed)]
+            queue = set()
+            probe_results = await asyncio.gather(
+                *[prober.probe(u, "discovery") for u in batch], return_exceptions=True)
+            new_urls: "set[str]" = set()
+            for u, rec in zip(batch, probe_results):
+                probed.add(u)
+                if isinstance(rec, Exception) or rec is None:
+                    continue
+                records.append(rec)
+                if not rec.is_js:
+                    continue
+                text = rec.text or ""
+                await self._extract_sourcemap(engine, rec)
+                new_urls |= reconstruct_webpack_chunks(text, rec.url)
+                new_urls |= {u2 for u2 in extract_js_links(text, rec.url) if looks_like_js_url(u2)}
+                low = rec.url.lower()
+                if low.endswith(("asset-manifest.json", "chunk-manifest.json")):
+                    new_urls |= parse_asset_manifest(text, rec.url)
+                if low.endswith("manifest.json"):
+                    new_urls |= parse_vite_manifest(text, rec.url)
+                if "buildmanifest" in low:
+                    new_urls |= parse_next_build_manifest(text, rec.url)
+            for u in new_urls:
+                if u not in probed and scope.in_scope(u):
+                    queue.add(u)
+        coverage["techniques"]["total_probed"] = len(probed)
+        coverage["techniques"]["js_files"] = sum(1 for r in records if r.is_js)
+        coverage["iterations"] = iterations
+
+        # --- 5. Analyze ---
+        if not cfg.no_analyze:
+            for rec in records:
+                if not rec.is_js:
+                    continue
+                rec.secrets = scan_secrets(rec.text or "")
+                rec.endpoints = scan_endpoints(rec.text or "")
+                rec.score = score_record(rec, rec.secrets, rec.endpoints)
+
+        # --- 6. Validate (opt-in) ---
+        if cfg.validate:
+            pairs = [(rec, s) for rec in records for s in (rec.secrets or [])]
+            vres = await asyncio.gather(
+                *[validate_secret(engine, s) for _, s in pairs], return_exceptions=True)
+            for (rec, _s), vr in zip(pairs, vres):
+                if isinstance(vr, dict):
+                    rec.validated.append(vr)
+
+        await engine.close()
+
+        sev_counts: dict = {}
+        for rec in records:
+            for s in (rec.secrets or []):
+                sev_counts[s.severity] = sev_counts.get(s.severity, 0) + 1
+        findings = {
+            "secret_severity_counts": sev_counts,
+            "files_with_secrets": sum(1 for r in records if r.secrets),
+            "total_secrets": sum(len(r.secrets or []) for r in records),
+            "total_endpoints": sum(len(r.endpoints or []) for r in records),
+            "source_maps": sum(1 for r in records if r.sourcemap_url),
+        }
+        return RunState(cfg.domain, records, coverage, findings, json_only=cfg.json_only)
+
+    async def _extract_sourcemap(self, engine: HttpEngine, rec: FileRecord) -> None:
+        text = rec.text or ""
+        sm_url = find_sourcemap_url(text, rec.url)
+        smap = None
+        if sm_url and sm_url.startswith("data:"):
+            rec.sourcemap_url = "inline"
+            smap = parse_sourcemap(sourcemap_from_datauri(sm_url))
+        elif sm_url:
+            rr = await engine.get(sm_url)
+            if not rr.error and rr.status == 200 and (rr.text or "").lstrip().startswith("{"):
+                rec.sourcemap_url = sm_url
+                smap = parse_sourcemap(rr.text)
+        else:
+            rr = await engine.get(rec.url + ".map")
+            if not rr.error and rr.status == 200 and (rr.text or "").lstrip().startswith("{"):
+                rec.sourcemap_url = rec.url + ".map"
+                smap = parse_sourcemap(rr.text)
+        if smap:
+            rec.revealed_sources = revealed_source_paths(smap, rec.sourcemap_url or rec.url)
+            if self.cfg.rebuild_src and self.cfg.outdir and smap.get("sourcesContent"):
+                root = Path(self.cfg.outdir) / "original_src"
+                for src, content in zip(smap.get("sources") or [], smap.get("sourcesContent") or []):
+                    if not content:
+                        continue
+                    try:
+                        p = _safe_child_path(root, src)
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_text(content, encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+
+
+@selftest("orchestrator.finds_hidden_chunk")
+def _t_orch():
+    base, stop = _serve({
+        "/": ("text/html", b'<script src="/static/js/main.js"></script>'),
+        "/static/js/main.js": ("application/javascript",
+            b'a.p="/static/js/";t.u=function(e){return e+"."+{9:"beef"}[e]+".chunk.js"};'
+            b'//# sourceMappingURL=main.js.map'),
+        "/static/js/main.js.map": ("application/json",
+            b'{"version":3,"sources":["../src/hidden.ts"]}'),
+        "/static/js/9.beef.chunk.js": ("application/javascript",
+            b'const k="AKIAIOSFODNN7EXAMPLE"'),
+    })
+    try:
+        cfg = Config.defaults()
+        cfg.domain = _host(base)
+        cfg.seeds = [base + "/"]
+        cfg.allow_subs = True   # local guard skips archives; crawl drives discovery
+        st = _run(Orchestrator(cfg).run())
+        urls = {r.url for r in st.records}
+        assert any(u.endswith("/9.beef.chunk.js") for u in urls), urls  # hidden chunk
+        assert any("hidden.ts" in p for r in st.records for p in r.revealed_sources), \
+            [r.revealed_sources for r in st.records]
+        # the hidden chunk's AWS key was analyzed
+        assert st.findings["total_secrets"] >= 1, st.findings
+    finally:
+        stop()
 
 
 # @@INSERT_SECTIONS_ABOVE@@
