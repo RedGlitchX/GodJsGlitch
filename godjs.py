@@ -606,6 +606,84 @@ def _t_probe():
         stop()
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Source-map mining (reveal the original module tree)
+# ----------------------------------------------------------------------------
+_SMAP_RE = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
+
+
+def find_sourcemap_url(js_text: str, base: str) -> "Optional[str]":
+    """Return the sourceMappingURL declared in a JS file (absolutized), or None.
+
+    Data-URI source maps are returned verbatim (caller decodes with
+    sourcemap_from_datauri). The `.map`-by-convention fallback is handled by the
+    orchestrator, which additionally probes `<js_url>.map`.
+    """
+    last = None
+    for last in _SMAP_RE.finditer(js_text):
+        pass
+    if not last:
+        return None
+    u = last.group(1).strip()
+    if u.startswith("data:"):
+        return u
+    return canonicalize_url(u, base)
+
+
+def sourcemap_from_datauri(u: str) -> str:
+    """Decode an inline `data:` source map into its JSON text."""
+    try:
+        header, payload = u.split(",", 1)
+        if ";base64" in header:
+            return base64.b64decode(payload).decode("utf-8", "replace")
+        return urllib.parse.unquote(payload)
+    except Exception:
+        return ""
+
+
+def parse_sourcemap(text: str) -> dict:
+    """Parse a source map JSON into a normalized dict (guarded)."""
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {"sources": [], "sourcesContent": None, "sourceRoot": ""}
+    return {
+        "sources": data.get("sources") or [],
+        "sourcesContent": data.get("sourcesContent"),
+        "sourceRoot": data.get("sourceRoot") or "",
+    }
+
+
+def revealed_source_paths(smap: dict, base: str) -> "list[str]":
+    """Turn a parsed source map's sources[] into revealed original paths."""
+    root = smap.get("sourceRoot") or ""
+    out: "list[str]" = []
+    for s in smap.get("sources") or []:
+        if not s:
+            continue
+        if s.startswith("webpack://") or "://" in s:
+            out.append(s)  # keep marker verbatim
+        else:
+            out.append(root + s if root else s)
+    return out
+
+
+@selftest("sourcemap.find_and_parse")
+def _t_smap():
+    js = "var a=1;\n//# sourceMappingURL=app.js.map"
+    assert find_sourcemap_url(js, "https://x.com/s/app.js") == "https://x.com/s/app.js.map"
+    assert find_sourcemap_url("no map here", "https://x.com/a.js") is None
+    smap = parse_sourcemap(
+        '{"version":3,"sources":["../src/secret.ts","webpack://app/./util.js"],"sourceRoot":""}')
+    paths = revealed_source_paths(smap, "https://x.com/s/app.js.map")
+    assert any("secret.ts" in p for p in paths)
+    assert any(p.startswith("webpack://") for p in paths)
+    # inline data-URI map decodes
+    b64 = base64.b64encode(b'{"version":3,"sources":["../src/inline.ts"]}').decode()
+    text = sourcemap_from_datauri("data:application/json;base64," + b64)
+    assert "inline.ts" in text
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
