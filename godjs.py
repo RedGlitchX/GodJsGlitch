@@ -1429,6 +1429,162 @@ def _t_jwt():
     assert dec and dec["payload"]["role"] == "admin" and dec["header"]["alg"] == "none"
 
 
+# ----------------------------------------------------------------------------
+# SECTION: validate.live (opt-in) - prove secrets with read-only calls
+# ----------------------------------------------------------------------------
+def _hmac_sha256(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def derive_signing_key(secret_key: str, date_stamp: str, region: str, service: str) -> bytes:
+    """AWS SigV4 signing key derivation (deterministic; matches AWS doc vector)."""
+    k_date = _hmac_sha256(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    k_region = _hmac_sha256(k_date, region)
+    k_service = _hmac_sha256(k_region, service)
+    return _hmac_sha256(k_service, "aws4_request")
+
+
+def build_sts_request(akid: str, secret: str, session_token: "Optional[str]" = None,
+                      region: str = "us-east-1") -> "tuple[str, dict]":
+    """Build a signed STS GetCallerIdentity GET request (url, headers)."""
+    service, host = "sts", "sts.amazonaws.com"
+    t = time.gmtime()
+    amzdate = time.strftime("%Y%m%dT%H%M%SZ", t)
+    datestamp = time.strftime("%Y%m%d", t)
+    method, canonical_uri = "GET", "/"
+    qs = "Action=GetCallerIdentity&Version=2011-06-15"
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    if session_token:
+        canonical_headers = (f"host:{host}\nx-amz-date:{amzdate}\n"
+                             f"x-amz-security-token:{session_token}\n")
+        signed_headers = "host;x-amz-date;x-amz-security-token"
+    else:
+        canonical_headers = f"host:{host}\nx-amz-date:{amzdate}\n"
+        signed_headers = "host;x-amz-date"
+    canonical_request = "\n".join(
+        [method, canonical_uri, qs, canonical_headers, signed_headers, payload_hash])
+    scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amzdate, scope,
+         hashlib.sha256(canonical_request.encode()).hexdigest()])
+    signing_key = derive_signing_key(secret, datestamp, region, service)
+    signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    auth = (f"AWS4-HMAC-SHA256 Credential={akid}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}")
+    headers = {"x-amz-date": amzdate, "Authorization": auth}
+    if session_token:
+        headers["x-amz-security-token"] = session_token
+    return f"https://{host}/?{qs}", headers
+
+
+def _simple_http(method: str, url: str, headers=None, timeout=15.0, proxy=None):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    hs = [urllib.request.HTTPSHandler(context=ctx)]
+    if proxy:
+        hs.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*hs)
+    req = urllib.request.Request(url, method=method, headers=headers or {})
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return getattr(r, "status", 200), r.read().decode("utf-8", "replace")[:2000]
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:2000]
+        except Exception:
+            body = ""
+        return e.code, body
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
+async def _aget(url, headers=None, timeout=15.0, proxy=None, method="GET"):
+    return await asyncio.to_thread(_simple_http, method, url, headers, timeout, proxy)
+
+
+async def validate_secret(engine: "Optional[HttpEngine]", secret: Secret) -> dict:
+    """Actively validate a secret with a READ-ONLY call. Never destructive."""
+    t, v = secret.type, secret.match
+    proxy = engine.cfg.proxy if engine else None
+    timeout = engine.cfg.timeout if engine else 15.0
+
+    def result(status, detail=""):
+        return {"type": t, "match": v[:40] + ("..." if len(v) > 40 else ""),
+                "status": status, "detail": detail}
+
+    try:
+        if t == "jwt":
+            dec = decode_jwt(v)
+            return result("decoded" if dec else "unverified", dec or "")
+        if t == "private_key":
+            return result("found", "private key material present (no network check)")
+        if t in ("mongodb_uri", "postgres_uri", "mysql_uri", "redis_uri", "amqp_uri"):
+            return result("unverified", "DB URI - not connecting (would be intrusive)")
+
+        if t in ("stripe_secret_key", "stripe_restricted_key"):
+            b = base64.b64encode((v + ":").encode()).decode()
+            st, body = await _aget("https://api.stripe.com/v1/account",
+                                   {"Authorization": "Basic " + b}, timeout, proxy)
+            return result("valid" if st == 200 else "invalid", f"HTTP {st}")
+        if t in ("github_pat", "github_fine_grained_pat", "github_oauth"):
+            st, body = await _aget("https://api.github.com/user",
+                                   {"Authorization": "token " + v,
+                                    "User-Agent": "godjs"}, timeout, proxy)
+            return result("valid" if st == 200 else "invalid", f"HTTP {st}")
+        if t == "openai_key":
+            st, _ = await _aget("https://api.openai.com/v1/models",
+                                {"Authorization": "Bearer " + v}, timeout, proxy)
+            return result("valid" if st == 200 else "invalid", f"HTTP {st}")
+        if t == "huggingface_token":
+            st, _ = await _aget("https://huggingface.co/api/whoami-v2",
+                                {"Authorization": "Bearer " + v}, timeout, proxy)
+            return result("valid" if st == 200 else "invalid", f"HTTP {st}")
+        if t == "npm_token":
+            st, _ = await _aget("https://registry.npmjs.org/-/whoami",
+                                {"Authorization": "Bearer " + v}, timeout, proxy)
+            return result("valid" if st == 200 else "invalid", f"HTTP {st}")
+        if t == "gcp_api_key":
+            st, body = await _aget(
+                "https://maps.googleapis.com/maps/api/geocode/json?address=x&key=" + v,
+                None, timeout, proxy)
+            ok = st == 200 and "REQUEST_DENIED" not in (body or "")
+            return result("valid" if ok else "invalid", f"HTTP {st}")
+        if t == "slack_webhook":
+            # GET (never POST) - valid hooks reject the payload, dead ones say no_service
+            st, body = await _aget(v, None, timeout, proxy)
+            if body and "no_service" in body:
+                return result("invalid", "no_service")
+            if st in (400, 405) or (body and "invalid_payload" in body):
+                return result("valid", f"HTTP {st} (endpoint live)")
+            return result("unverified", f"HTTP {st}")
+        if t == "aws_access_key_id":
+            return result("unverified", "need paired secret key to sign STS call")
+    except Exception as e:  # noqa: BLE001
+        return result("unverified", f"{type(e).__name__}: {e}")
+    return result("unverified", "no validator for this type")
+
+
+@selftest("validate.sigv4_vector")
+def _t_sig():
+    # Authoritative AWS "Deriving the signing key" doc example.
+    k = derive_signing_key(
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20150830", "us-east-1", "iam")
+    assert k.hex() == "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9", k.hex()
+
+
+@selftest("validate.offline_dispatch")
+def _t_valoff():
+    h = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
+    p = base64.urlsafe_b64encode(b'{"sub":"1"}').decode().rstrip("=")
+    r1 = _run(validate_secret(None, Secret("jwt", f"{h}.{p}.", 0.0, "medium")))
+    assert r1["status"] == "decoded", r1
+    r2 = _run(validate_secret(None, Secret("private_key", "-----BEGIN PRIVATE KEY-----", 0.0, "critical")))
+    assert r2["status"] == "found", r2
+    r3 = _run(validate_secret(None, Secret("mongodb_uri", "mongodb://a:b@h/db", 0.0, "high")))
+    assert r3["status"] == "unverified", r3
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
