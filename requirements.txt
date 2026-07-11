@@ -1,0 +1,8 @@
+# GodJS has NO required dependencies (stdlib-only will run).
+# The following are OPTIONAL and only enhance performance/output if installed:
+
+httpx           # preferred async HTTP backend (falls back to requests, then urllib)
+requests         # secondary HTTP backend
+tldextract       # accurate apex/subdomain parsing (falls back to builtin heuristic)
+beautifulsoup4   # robust HTML parsing (falls back to regex)
+rich             # prettier console output (falls back to plain)
