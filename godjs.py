@@ -2064,10 +2064,16 @@ async def render_pages(cfg: Config, scope: Scope, seeds: "list[str]") -> "tuple[
                 await page.close()
             await browser.close()
     except Exception as e:  # noqa: BLE001
-        msg = str(e)
-        if "Executable doesn't exist" in msg or "playwright install" in msg:
-            return js, "error: browser not installed (run: playwright install chromium)"
-        return js, f"error: {type(e).__name__}"
+        msg = str(e).lower()
+        if "node" in msg or "no such file" in msg:
+            return js, ("error: Playwright driver needs Node.js. Cleanest fix - use a venv "
+                        "with pip (bundles its own node): python3 -m venv ~/.venv/godjs && "
+                        "source ~/.venv/godjs/bin/activate && pip install playwright httpx && "
+                        "playwright install chromium. (Or, for apt's python3-playwright: "
+                        "sudo apt install nodejs)")
+        if "executable doesn't exist" in msg or "playwright install" in msg:
+            return js, "error: browser not installed - run: playwright install chromium"
+        return js, f"error: {type(e).__name__}: {e}"
     return js, "ok"
 
 
