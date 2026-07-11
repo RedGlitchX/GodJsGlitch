@@ -55,6 +55,22 @@ Output lands in `./godjs_out/<domain>/`:
 - `results.json` — full per-file metadata + coverage summary
 - `report.html` — self-contained ranked report
 
+## Found 0 files?
+
+The **active crawl is the primary JS finder** — it fetches the live site (and any
+page URLs harvested from passive sources) and extracts every `<script src>`, chunk,
+and source map. `--passive` **skips the crawl** and relies only on archives, which
+are often incomplete or rate-limited, so a passive-only run can legitimately find
+little. If you got nothing:
+
+1. **Drop `--passive`** and run the default hunt: `python godjs.py example.com` — this crawls the live site.
+2. Add **`--verbose`** to see per-provider status and per-phase diagnostics.
+3. If the site blocks bots, pass a session: `--header 'Cookie: sessionid=...'` and/or `--proxy http://127.0.0.1:8080`.
+4. Confirm the domain resolves and is reachable from your host.
+
+When a run finds nothing, GodJsGlitch now prints each provider's status (e.g.
+`wayback: timeout`, `otx: ok (2500 urls, 0 js, 1 pages)`) and concrete next steps.
+
 ## Safety
 
 Authorized testing only. Configurable concurrency + per-host rate limiting, custom

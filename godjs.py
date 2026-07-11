@@ -503,14 +503,15 @@ class HttpEngine:
         return await asyncio.to_thread(self._fetch_urllib_sync, method, url)
 
     @staticmethod
-    def _is_dns_error(e: Exception) -> bool:
-        if isinstance(e, socket.gaierror):
+    def _no_retry(e: Exception) -> bool:
+        """DNS failures and timeouts won't succeed on retry - and retrying doubles the wait."""
+        if isinstance(e, (socket.gaierror, socket.timeout, TimeoutError)):
             return True
         m = str(e).lower()
         return any(s in m for s in (
             "getaddrinfo", "name or service not known", "nodename nor servname",
             "temporary failure in name resolution", "no address associated",
-            "name does not resolve"))
+            "name does not resolve", "timeout", "timed out"))
 
     async def _request(self, method: str, url: str) -> Response:
         host = _host(url)
@@ -522,8 +523,7 @@ class HttpEngine:
                     return await self._dispatch(method, url)
                 except Exception as e:  # noqa: BLE001 - network error -> maybe retry, then record
                     last_err = e
-                    # retrying a name-resolution failure is pointless and slow
-                    if self._is_dns_error(e) or attempt >= self.cfg.retries:
+                    if self._no_retry(e) or attempt >= self.cfg.retries:
                         break
                     await asyncio.sleep(0.2 * (attempt + 1))
             return Response(url, None, {}, "", b"",
@@ -1057,25 +1057,39 @@ def _t_jsinjs():
 #   Pure parsers are unit-tested; async fetchers wrap engine + parser, guarded.
 # ----------------------------------------------------------------------------
 def parse_wayback_cdx(text: str) -> "set[str]":
-    """Parse Wayback CDX JSON (fl=original) into a set of JS URLs."""
+    """Parse Wayback CDX output (JSON array or plain text lines) into all URLs.
+
+    Returns every archived URL (not just .js); the orchestrator splits JS
+    candidates from page seeds. Accepts both output=json and output=text.
+    """
     out: "set[str]" = set()
-    try:
-        data = json.loads(text)
-    except Exception:
+    text = text.strip()
+    if not text:
         return out
-    if not isinstance(data, list):
-        return out
-    for i, row in enumerate(data):
-        if i == 0 and isinstance(row, list) and "original" in row:
-            continue
-        url = row[0] if isinstance(row, list) and row else (row if isinstance(row, str) else None)
-        if url and looks_like_js_url(url):
-            out.add(canonicalize_url(url))
+    if text[0] == "[":
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+        if isinstance(data, list):
+            for i, row in enumerate(data):
+                if i == 0 and isinstance(row, list) and "original" in row:
+                    continue
+                url = row[0] if isinstance(row, list) and row else (
+                    row if isinstance(row, str) else None)
+                if url and "://" in url:
+                    out.add(canonicalize_url(url))
+            return out
+    # plain-text: one original URL per line
+    for line in text.splitlines():
+        line = line.strip()
+        if "://" in line:
+            out.add(canonicalize_url(line.split()[0] if " " in line else line))
     return out
 
 
 def parse_otx(text: str) -> "set[str]":
-    """Parse AlienVault OTX url_list JSON into a set of JS URLs."""
+    """Parse AlienVault OTX url_list JSON into all URLs (pages + JS)."""
     out: "set[str]" = set()
     try:
         data = json.loads(text)
@@ -1083,28 +1097,30 @@ def parse_otx(text: str) -> "set[str]":
         return out
     for item in (data.get("url_list") or []):
         u = item.get("url") if isinstance(item, dict) else None
-        if u and looks_like_js_url(u):
+        if u and "://" in u:
             out.add(canonicalize_url(u))
     return out
 
 
 def parse_urlscan(text: str) -> "set[str]":
-    """Parse URLScan.io search JSON into a set of JS URLs."""
+    """Parse URLScan.io search JSON into all URLs (page + task urls)."""
     out: "set[str]" = set()
     try:
         data = json.loads(text)
     except Exception:
         return out
     for r in (data.get("results") or []):
-        page = r.get("page") or {} if isinstance(r, dict) else {}
-        u = page.get("url")
-        if u and looks_like_js_url(u):
-            out.add(canonicalize_url(u))
+        if not isinstance(r, dict):
+            continue
+        for key in ("page", "task"):
+            u = (r.get(key) or {}).get("url") if isinstance(r.get(key), dict) else None
+            if u and "://" in u:
+                out.add(canonicalize_url(u))
     return out
 
 
 def parse_commoncrawl(text: str) -> "set[str]":
-    """Parse Common Crawl index JSONL into a set of JS URLs."""
+    """Parse Common Crawl index JSONL into all URLs."""
     out: "set[str]" = set()
     for line in text.splitlines():
         line = line.strip()
@@ -1115,7 +1131,7 @@ def parse_commoncrawl(text: str) -> "set[str]":
         except Exception:
             continue
         u = obj.get("url") if isinstance(obj, dict) else None
-        if u and looks_like_js_url(u):
+        if u and "://" in u:
             out.add(canonicalize_url(u))
     return out
 
@@ -1136,52 +1152,88 @@ def parse_crtsh(text: str) -> "set[str]":
     return out
 
 
-async def source_wayback(engine: HttpEngine, domain: str) -> "set[str]":
-    url = (f"http://web.archive.org/cdx/search/cdx?url=*.{domain}/*"
-           f"&output=json&fl=original&collapse=urlkey&limit=50000")
+@dataclass
+class SourceResult:
+    urls: set
+    status: str      # "ok" | "empty" | "http <code>" | "error: <msg>"
+    detail: str = ""
+
+
+def _prov_status(r: Response, n: int) -> "tuple[str, str]":
+    if r.error:
+        return f"error: {r.error}", r.error
+    if r.status and r.status != 200:
+        return f"http {r.status}", ""
+    return ("ok" if n else "empty"), ""
+
+
+async def source_wayback(engine: HttpEngine, domain: str) -> SourceResult:
+    url = (f"http://web.archive.org/cdx/search/cdx?url={domain}/*"
+           f"&output=text&fl=original&collapse=urlkey&limit=50000")
     r = await engine.get(url)
-    return parse_wayback_cdx(r.text) if (not r.error and r.text) else set()
+    urls = parse_wayback_cdx(r.text) if (not r.error and r.text) else set()
+    st, dt = _prov_status(r, len(urls))
+    return SourceResult(urls, st, dt)
 
 
-async def source_otx(engine: HttpEngine, domain: str) -> "set[str]":
+async def source_otx(engine: HttpEngine, domain: str) -> SourceResult:
     out: "set[str]" = set()
-    for page in (1, 2, 3):
+    last = None
+    for page in (1, 2, 3, 4, 5):
         r = await engine.get(
-            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list?limit=500&page={page}")
-        if r.error or not r.text:
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list"
+            f"?limit=500&page={page}")
+        last = r
+        if r.error or r.status != 200 or not r.text:
             break
         got = parse_otx(r.text)
-        if not got:
-            break
         out |= got
-    return out
+        if len(got) < 500:
+            break
+    st, dt = _prov_status(last, len(out)) if last else ("empty", "")
+    return SourceResult(out, "ok" if out else st, dt)
 
 
-async def source_urlscan(engine: HttpEngine, domain: str) -> "set[str]":
+async def source_urlscan(engine: HttpEngine, domain: str) -> SourceResult:
     r = await engine.get(f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=1000")
-    return parse_urlscan(r.text) if (not r.error and r.text) else set()
+    urls = parse_urlscan(r.text) if (not r.error and r.text) else set()
+    st, dt = _prov_status(r, len(urls))
+    return SourceResult(urls, st, dt)
 
 
-async def source_commoncrawl(engine: HttpEngine, domain: str) -> "set[str]":
+async def source_commoncrawl(engine: HttpEngine, domain: str) -> SourceResult:
     r = await engine.get("https://index.commoncrawl.org/collinfo.json")
-    if r.error or not r.text:
-        return set()
+    if r.error or r.status != 200 or not r.text:
+        st, dt = _prov_status(r, 0)
+        return SourceResult(set(), st, dt)
     try:
         idx = json.loads(r.text)
     except Exception:
-        return set()
+        return SourceResult(set(), "error: bad collinfo", "")
     if not idx or not isinstance(idx, list):
-        return set()
+        return SourceResult(set(), "empty", "")
     api = idx[0].get("cdx-api")
     if not api:
-        return set()
-    r2 = await engine.get(f"{api}?url=*.{domain}&output=json&fl=url&limit=50000")
-    return parse_commoncrawl(r2.text) if (not r2.error and r2.text) else set()
+        return SourceResult(set(), "empty", "")
+    r2 = await engine.get(f"{api}?url={domain}/*&output=json&fl=url&limit=50000")
+    urls = parse_commoncrawl(r2.text) if (not r2.error and r2.text) else set()
+    st, dt = _prov_status(r2, len(urls))
+    return SourceResult(urls, st, dt)
 
 
-async def source_crtsh(engine: HttpEngine, domain: str) -> "set[str]":
-    r = await engine.get(f"https://crt.sh/?q=%25.{domain}&output=json")
-    return parse_crtsh(r.text) if (not r.error and r.text) else set()
+async def source_crtsh(engine: HttpEngine, domain: str) -> SourceResult:
+    r = None
+    for attempt in range(2):  # crt.sh 5xx/rate-limits are common and transient
+        r = await engine.get(f"https://crt.sh/?q=%25.{domain}&output=json")
+        if not r.error and r.status == 200 and r.text.lstrip().startswith("["):
+            hosts = parse_crtsh(r.text)
+            return SourceResult(hosts, "ok" if hosts else "empty", "")
+        if r.status and r.status >= 500 and attempt == 0:
+            await asyncio.sleep(1.0)
+            continue
+        break
+    st, dt = _prov_status(r, 0) if r else ("error: no response", "")
+    return SourceResult(set(), st, dt)
 
 
 @selftest("sources.parsers")
@@ -1196,6 +1248,19 @@ def _t_src():
         '{"url":"https://x.com/c.js"}\n{"url":"https://x.com/c.png"}')
     assert "cdn.x.com" in parse_crtsh('[{"name_value":"cdn.x.com\\nx.com"}]')
     assert "x.com" in parse_crtsh('[{"name_value":"*.x.com"}]')
+
+
+@selftest("sources.harvest_pages_and_js")
+def _t_src_pages():
+    # providers now return ALL urls (pages + js) so pages can seed the crawler
+    otx = parse_otx('{"url_list":[{"url":"https://x.com/buy/form"},{"url":"https://x.com/b.js"}]}')
+    assert "https://x.com/buy/form" in otx and "https://x.com/b.js" in otx
+    us = parse_urlscan(
+        '{"results":[{"page":{"url":"https://x.com/p"},"task":{"url":"https://x.com/t"}}]}')
+    assert {"https://x.com/p", "https://x.com/t"} <= us
+    # wayback also accepts plain-text (output=text) responses
+    wb = parse_wayback_cdx("https://x.com/a.js\nhttps://x.com/page")
+    assert {"https://x.com/a.js", "https://x.com/page"} <= wb
 
 
 # ----------------------------------------------------------------------------
@@ -1850,6 +1915,12 @@ def _t_bridge():
 # ----------------------------------------------------------------------------
 # SECTION: Orchestrator - recursive fixpoint discovery pipeline
 # ----------------------------------------------------------------------------
+def _vlog(cfg: Config, msg: str) -> None:
+    """Print a diagnostic line when --verbose is on."""
+    if getattr(cfg, "verbose", 0):
+        print(f"[godjsglitch]   {msg}", file=sys.stderr)
+
+
 def _is_local_host(host: str) -> bool:
     host = (host or "").lower()
     if host in ("localhost", "127.0.0.1", "::1"):
@@ -1899,41 +1970,64 @@ class Orchestrator:
         # --- 1. Passive archives (skipped for local/IP targets) ---
         # All providers run concurrently under one wall-clock budget: a slow or
         # hanging provider can never stall the run - we take whatever finished.
+        # Providers return ALL urls; JS becomes a candidate, pages become crawl seeds.
+        passive_pages: "set[str]" = set()
         if not local:
             provs = [("wayback", source_wayback), ("otx", source_otx),
                      ("urlscan", source_urlscan), ("commoncrawl", source_commoncrawl),
                      ("crtsh", source_crtsh)]
+            _vlog(cfg, f"passive: querying {len(provs)} sources (budget {cfg.passive_budget}s)...")
             task_name = {asyncio.ensure_future(f(engine, cfg.domain)): name for name, f in provs}
             done, pending = await asyncio.wait(
                 list(task_name.keys()), timeout=cfg.passive_budget)
             for t in pending:
                 t.cancel()
                 coverage["providers"][task_name[t]] = "timeout"
+                _vlog(cfg, f"passive {task_name[t]}: TIMEOUT (exceeded {cfg.passive_budget}s budget)")
             for t in done:
                 name = task_name[t]
                 try:
                     res = t.result()
-                except Exception:
-                    res = set()
-                res = res if isinstance(res, set) else set()
+                except Exception as e:
+                    res = SourceResult(set(), f"error: {type(e).__name__}", "")
+                if not isinstance(res, SourceResult):
+                    res = SourceResult(res if isinstance(res, set) else set(), "ok", "")
                 if name == "crtsh":
-                    subdomains = {s for s in res if scope.in_scope("https://" + s + "/")}
-                    coverage["providers"]["crtsh_subdomains"] = len(subdomains)
+                    subs = {s for s in res.urls if scope.in_scope("https://" + s + "/")}
+                    subdomains |= subs
+                    coverage["providers"]["crtsh"] = f"{res.status} ({len(subs)} subs)"
+                    _vlog(cfg, f"passive crtsh: {res.status} -> {len(subs)} in-scope subdomains")
                 else:
-                    coverage["providers"][name] = len(res)
-                    candidates |= {u for u in res if scope.in_scope(u)}
+                    in_scope = {u for u in res.urls if scope.in_scope(u)}
+                    js = {u for u in in_scope if looks_like_js_url(u)}
+                    pages = {u for u in in_scope if u not in js and _is_page(u)}
+                    candidates |= js
+                    passive_pages |= pages
+                    coverage["providers"][name] = (
+                        f"{res.status} ({len(res.urls)} urls, {len(js)} js, {len(pages)} pages)")
+                    _vlog(cfg, f"passive {name}: {res.status} -> {len(res.urls)} urls "
+                               f"({len(js)} js, {len(pages)} page-seeds)")
 
         # --- 2. Seeds + active crawl ---
+        # Seed the crawler with homepage + subdomain roots + passive page URLs
+        # (OTX/urlscan/wayback pages are live pages that *contain* the JS bundles).
         seeds = list(cfg.seeds) if cfg.seeds else [
             f"https://{cfg.domain}/", f"http://{cfg.domain}/"]
-        if cfg.allow_subs and not cfg.passive:
+        if cfg.allow_subs:
             seeds += ["https://" + s + "/" for s in list(subdomains)[:50]]
+        seeds += list(passive_pages)[:300]
         if not cfg.passive:
+            _vlog(cfg, f"crawl: {len(set(seeds))} seed URLs "
+                       f"({len(passive_pages)} from passive), depth {cfg.depth}...")
             spider = Spider(engine, scope, cfg)
             js_from_crawl, html_records = await spider.crawl(seeds)
             candidates |= {u for u in js_from_crawl if scope.in_scope(u)}
             coverage["techniques"]["crawl_js"] = len(js_from_crawl)
             coverage["techniques"]["html_pages_crawled"] = len(html_records)
+            _vlog(cfg, f"crawl: found {len(js_from_crawl)} JS from {len(html_records)} pages")
+        else:
+            _vlog(cfg, f"passive mode: skipping crawl ({len(passive_pages)} page-seeds unused; "
+                       f"run without --passive to crawl them for live JS)")
 
         # --- 3. Opportunistic Go-tool bridge ---
         try:
@@ -1947,11 +2041,14 @@ class Orchestrator:
         records: "list[FileRecord]" = []
         probed: "set[str]" = set()
         queue = {u for u in candidates if scope.in_scope(u)}
+        _vlog(cfg, f"discovery complete: {len(queue)} JS candidates to probe")
         iterations = 0
         while queue and len(probed) < cfg.max_urls and iterations < 6:
             iterations += 1
             batch = [u for u in queue if u not in probed][:cfg.max_urls - len(probed)]
             queue = set()
+            _vlog(cfg, f"probe iteration {iterations}: {len(batch)} candidates "
+                       f"({sum(1 for r in records if r.is_js)} JS found so far)")
             probe_results = await asyncio.gather(
                 *[prober.probe(u, "discovery") for u in batch], return_exceptions=True)
             new_urls: "set[str]" = set()
@@ -2207,7 +2304,8 @@ def main(argv=None) -> int:
     write_all(state, cfg.outdir)
     dt = time.time() - t0
     f = state.findings
-    print(f"[godjsglitch] done in {dt:.1f}s: {len(state.records)} JS files, "
+    n = len([r for r in state.records if r.is_js])
+    print(f"[godjsglitch] done in {dt:.1f}s: {n} JS files, "
           f"{f['files_with_secrets']} with secrets, {f['total_secrets']} secret candidates, "
           f"{f['source_maps']} source maps, {f['total_endpoints']} endpoints")
     print(f"[godjsglitch] output -> {cfg.outdir}{os.sep}  (js_urls.txt, results.json"
@@ -2219,6 +2317,23 @@ def main(argv=None) -> int:
         for r in top:
             tags = ",".join(sorted({s.type for s in r.secrets})) if r.secrets else ""
             print(f"   {r.score:6.1f}  {r.url}  {tags}")
+
+    # When nothing turned up, explain WHY (provider status) and how to fix it.
+    if n == 0:
+        print("[godjsglitch] no JS files found. Provider status:")
+        for name, stat in (state.coverage.get("providers") or {}).items():
+            print(f"     {name:<12}: {stat}")
+        hints = []
+        if cfg.passive:
+            hints.append("you ran --passive (archives only); re-run WITHOUT --passive "
+                         "to crawl the live site and its pages for JS")
+        else:
+            hints.append("the site may block automated requests - try "
+                         "--header 'Cookie: <session>' and/or --proxy, or raise --depth")
+        hints.append("verify the domain resolves and is reachable from this host")
+        hints.append("re-run with --verbose to see per-phase diagnostics")
+        for h in hints:
+            print(f"     hint: {h}")
     return 0
 
 
