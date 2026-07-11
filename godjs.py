@@ -1871,6 +1871,21 @@ def parse_tool_lines(text: str) -> "set[str]":
     return out
 
 
+def parse_host_lines(text: str) -> "set[str]":
+    """Parse newline-delimited hostnames emitted by subfinder/etc."""
+    out: "set[str]" = set()
+    for line in (text or "").splitlines():
+        line = line.strip().lower()
+        if not line:
+            continue
+        if "://" in line:
+            line = urllib.parse.urlsplit(line).hostname or ""
+        line = line.split("/")[0].strip().lstrip("*.")
+        if line and "." in line and " " not in line:
+            out.add(line)
+    return out
+
+
 async def _run_tool(args: "list[str]", timeout: float = 120.0) -> str:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1904,12 +1919,28 @@ async def bridge_augment(domain: str, scope: Scope) -> "set[str]":
     return out
 
 
+async def bridge_subdomains(domain: str, scope: Scope) -> "set[str]":
+    """Enumerate subdomains via subfinder if present. Returns in-scope hostnames."""
+    if not tool_on_path("subfinder"):
+        return set()
+    txt = await _run_tool(["subfinder", "-d", domain, "-silent"])
+    return {h for h in parse_host_lines(txt) if scope.in_scope("https://" + h + "/")}
+
+
 @selftest("bridge.parse_and_absent")
 def _t_bridge():
     assert parse_tool_lines("https://x.com/a.js\n\nhttps://x.com/b.js\n") == {
         "https://x.com/a.js", "https://x.com/b.js"}
     # this machine has no Go tools -> augment returns empty and never raises
     assert _run(bridge_augment("example.com", Scope("example.com"))) == set()
+
+
+@selftest("bridge.subfinder_parse_and_absent")
+def _t_bridge_sf():
+    hosts = parse_host_lines("www.x.com\napi.x.com\n\nhttps://cdn.x.com/\n*.x.com\n")
+    assert {"www.x.com", "api.x.com", "cdn.x.com", "x.com"} <= hosts
+    # subfinder absent on this machine -> empty, never raises
+    assert _run(bridge_subdomains("example.com", Scope("example.com"))) == set()
 
 
 # ----------------------------------------------------------------------------
@@ -2008,13 +2039,24 @@ class Orchestrator:
                     _vlog(cfg, f"passive {name}: {res.status} -> {len(res.urls)} urls "
                                f"({len(js)} js, {len(pages)} page-seeds)")
 
+            # subfinder (if installed) widens subdomain discovery beyond crt.sh
+            if tool_on_path("subfinder"):
+                try:
+                    sf = await bridge_subdomains(cfg.domain, scope)
+                except Exception:
+                    sf = set()
+                new = sf - subdomains
+                subdomains |= sf
+                coverage["providers"]["subfinder"] = f"ok ({len(sf)} subs, {len(new)} new)"
+                _vlog(cfg, f"bridge subfinder: {len(sf)} subdomains ({len(new)} new beyond crt.sh)")
+
         # --- 2. Seeds + active crawl ---
         # Seed the crawler with homepage + subdomain roots + passive page URLs
         # (OTX/urlscan/wayback pages are live pages that *contain* the JS bundles).
         seeds = list(cfg.seeds) if cfg.seeds else [
             f"https://{cfg.domain}/", f"http://{cfg.domain}/"]
         if cfg.allow_subs:
-            seeds += ["https://" + s + "/" for s in list(subdomains)[:50]]
+            seeds += ["https://" + s + "/" for s in list(subdomains)[:100]]
         seeds += list(passive_pages)[:300]
         if not cfg.passive:
             _vlog(cfg, f"crawl: {len(set(seeds))} seed URLs "
