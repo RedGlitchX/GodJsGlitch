@@ -1738,6 +1738,64 @@ def _t_rep():
     assert "<html" in html.lower() and "x.com" in html
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Bridge - opportunistically use Go tools if present (never required)
+# ----------------------------------------------------------------------------
+def tool_on_path(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def parse_tool_lines(text: str) -> "set[str]":
+    """Parse newline-delimited URLs emitted by katana/gau/etc."""
+    out: "set[str]" = set()
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line and "://" in line:
+            out.add(canonicalize_url(line))
+    return out
+
+
+async def _run_tool(args: "list[str]", timeout: float = 120.0) -> str:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return out.decode("utf-8", "replace")
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return ""
+
+
+async def bridge_augment(domain: str, scope: Scope) -> "set[str]":
+    """Augment discovery with any Go tools on PATH. Returns extra in-scope JS URLs."""
+    out: "set[str]" = set()
+    tasks = []
+    if tool_on_path("gau"):
+        tasks.append(_run_tool(["gau", domain]))
+    if tool_on_path("waybackurls"):
+        tasks.append(_run_tool(["waybackurls", domain]))
+    if tool_on_path("katana"):
+        tasks.append(_run_tool(
+            ["katana", "-u", f"https://{domain}", "-jc", "-silent", "-d", "2"]))
+    results = await asyncio.gather(*tasks) if tasks else []
+    for txt in results:
+        for u in parse_tool_lines(txt):
+            if looks_like_js_url(u) and scope.in_scope(u):
+                out.add(u)
+    return out
+
+
+@selftest("bridge.parse_and_absent")
+def _t_bridge():
+    assert parse_tool_lines("https://x.com/a.js\n\nhttps://x.com/b.js\n") == {
+        "https://x.com/a.js", "https://x.com/b.js"}
+    # this machine has no Go tools -> augment returns empty and never raises
+    assert _run(bridge_augment("example.com", Scope("example.com"))) == set()
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
