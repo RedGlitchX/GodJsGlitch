@@ -1,4 +1,4 @@
-# GodJS
+# GodJsGlitch
 
 A single-file, self-contained **JavaScript hunting engine** for authorized security testing.
 

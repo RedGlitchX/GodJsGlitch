@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GodJS - a self-contained JavaScript hunting engine.
+GodJsGlitch - a self-contained JavaScript hunting engine.
 
 Give it a domain; it discovers every associated JavaScript file it can reach:
   * live/linked JS (async crawler)
@@ -1721,7 +1721,7 @@ def render_html(state: RunState) -> str:
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GodJS report - {_esc(state.domain)}</title>
+<title>GodJsGlitch report - {_esc(state.domain)}</title>
 <style>
 :root{{color-scheme:light dark}}
 body{{font-family:system-ui,Segoe UI,Roboto,sans-serif;margin:0;background:#0d0d10;color:#e8e8ea}}
@@ -1745,7 +1745,7 @@ h4{{margin:10px 0 4px;font-size:12px;color:#9a9aa5;text-transform:uppercase;lett
 @media (prefers-color-scheme:light){{body{{background:#fff;color:#111}}header,.stat,th{{background:#f6f6f8}}header{{border-color:#e3e3e8}}}}
 </style></head>
 <body>
-<header><h1>GodJS &mdash; {_esc(state.domain)}</h1>
+<header><h1>GodJsGlitch &mdash; {_esc(state.domain)}</h1>
 <div class="sub">{total} unique JS files &middot; {with_secrets} with secret candidates &middot; ranked by juice score</div></header>
 <div class="wrap">
 <div class="stats">
@@ -2100,7 +2100,7 @@ def _t_cli():
 # CLI / entrypoint
 # ----------------------------------------------------------------------------
 def cmd_check_deps() -> int:
-    print("GodJS dependency report")
+    print("GodJsGlitch dependency report")
     print("  python        :", sys.version.split()[0])
     print("  httpx         :", "yes" if HAVE_HTTPX else "no (fallback: requests/urllib)")
     print("  requests      :", "yes" if HAVE_REQUESTS else "no")
@@ -2122,8 +2122,8 @@ def _normalize_domain(d: str) -> str:
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="godjs",
-        description="GodJS - hunt every JavaScript file for a domain (live, historical, hidden).",
+        prog="godjsglitch",
+        description="GodJsGlitch - hunt every JavaScript file for a domain (live, historical, hidden).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  python godjs.py example.com\n"
@@ -2194,7 +2194,7 @@ def main(argv=None) -> int:
         return 2
     cfg.outdir = cfg.outdir or str(Path("godjs_out") / cfg.domain)
 
-    print(f"[godjs] hunting JS for {cfg.domain}  "
+    print(f"[godjsglitch] hunting JS for {cfg.domain}  "
           f"(subs={'on' if cfg.allow_subs else 'off'}, "
           f"passive={'yes' if cfg.passive else 'no'}, "
           f"validate={'yes' if cfg.validate else 'no'}, backend={HttpEngine(cfg).backend})")
@@ -2202,20 +2202,20 @@ def main(argv=None) -> int:
     try:
         state = asyncio.run(Orchestrator(cfg).run())
     except KeyboardInterrupt:
-        print("\n[godjs] interrupted", file=sys.stderr)
+        print("\n[godjsglitch] interrupted", file=sys.stderr)
         return 130
     write_all(state, cfg.outdir)
     dt = time.time() - t0
     f = state.findings
-    print(f"[godjs] done in {dt:.1f}s: {len(state.records)} JS files, "
+    print(f"[godjsglitch] done in {dt:.1f}s: {len(state.records)} JS files, "
           f"{f['files_with_secrets']} with secrets, {f['total_secrets']} secret candidates, "
           f"{f['source_maps']} source maps, {f['total_endpoints']} endpoints")
-    print(f"[godjs] output -> {cfg.outdir}{os.sep}  (js_urls.txt, results.json"
+    print(f"[godjsglitch] output -> {cfg.outdir}{os.sep}  (js_urls.txt, results.json"
           f"{'' if cfg.json_only else ', report.html'})")
     top = sorted([r for r in state.records if r.is_js and r.score > 0],
                  key=lambda r: -r.score)[:10]
     if top:
-        print("[godjs] top-scored files:")
+        print("[godjsglitch] top-scored files:")
         for r in top:
             tags = ",".join(sorted({s.type for s in r.secrets})) if r.secrets else ""
             print(f"   {r.score:6.1f}  {r.url}  {tags}")
