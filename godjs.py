@@ -84,6 +84,12 @@ try:
 except Exception:
     HAVE_RICH = False
 
+try:
+    from playwright.async_api import async_playwright  # type: ignore
+    HAVE_PLAYWRIGHT = True
+except Exception:
+    HAVE_PLAYWRIGHT = False
+
 
 # ----------------------------------------------------------------------------
 # Selftest harness (dependency-free; runs via `python godjs.py --selftest`)
@@ -357,6 +363,8 @@ class Config:
     validate: bool = False
     rebuild_src: bool = False
     no_analyze: bool = False
+    render: bool = False
+    render_pages: int = 25
     outdir: "Optional[str]" = None
     scope_file: "Optional[str]" = None
     json_only: bool = False
@@ -390,6 +398,8 @@ class Config:
             validate=ns.validate,
             rebuild_src=ns.rebuild_src,
             no_analyze=ns.no_analyze,
+            render=ns.render,
+            render_pages=ns.render_pages,
             outdir=ns.outdir,
             scope_file=ns.scope,
             json_only=ns.json_only,
@@ -1989,6 +1999,60 @@ def _host_summary(hs: dict) -> str:
     return ",".join(sorted(codes)) or "no-response"
 
 
+async def render_pages(cfg: Config, scope: Scope, seeds: "list[str]") -> "tuple[set, str]":
+    """Drive headless Chromium (Playwright) to capture runtime-loaded JS.
+
+    Returns (js_urls, status). This is the only path that executes JavaScript,
+    so it captures dynamically-injected / lazily-loaded scripts exactly as the
+    browser's Network tab would - beyond what static parsing can see.
+    """
+    if not HAVE_PLAYWRIGHT:
+        return set(), "playwright not installed"
+    js: "set[str]" = set()
+    launch_kw: dict = {"headless": True}
+    if cfg.proxy:
+        launch_kw["proxy"] = {"server": cfg.proxy}
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_kw)
+            ctx = await browser.new_context(
+                user_agent=cfg.ua, ignore_https_errors=True,
+                extra_http_headers=dict(cfg.headers or {}))
+            for url in list(seeds)[:cfg.render_pages]:
+                page = await ctx.new_page()
+                collected: "set[str]" = set()
+
+                def on_resp(resp, _c=collected):
+                    try:
+                        rt = resp.request.resource_type
+                    except Exception:
+                        rt = ""
+                    u = resp.url
+                    if rt == "script" or looks_like_js_url(u):
+                        _c.add(u.split("#")[0])
+
+                page.on("response", on_resp)
+                try:
+                    await page.goto(url, wait_until="networkidle",
+                                    timeout=int(cfg.timeout * 1000))
+                    try:
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+                js |= collected
+                await page.close()
+            await browser.close()
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if "Executable doesn't exist" in msg or "playwright install" in msg:
+            return js, "error: browser not installed (run: playwright install chromium)"
+        return js, f"error: {type(e).__name__}"
+    return js, "ok"
+
+
 def _is_local_host(host: str) -> bool:
     host = (host or "").lower()
     if host in ("localhost", "127.0.0.1", "::1"):
@@ -2123,6 +2187,23 @@ class Orchestrator:
         else:
             _vlog(cfg, f"passive mode: skipping crawl ({len(passive_pages)} page-seeds unused; "
                        f"run without --passive to crawl them for live JS)")
+
+        # --- 2b. Headless render (opt-in): exact browser Network-tab parity ---
+        if cfg.render:
+            if not HAVE_PLAYWRIGHT:
+                coverage["techniques"]["render"] = "playwright-missing"
+                _vlog(cfg, "render: playwright not installed - skipping "
+                           "(pip install playwright && playwright install chromium)")
+            else:
+                _vlog(cfg, f"render: launching headless Chromium on up to "
+                           f"{cfg.render_pages} pages...")
+                rjs, rstatus = await render_pages(cfg, scope, seeds)
+                in_scope_rjs = {u for u in rjs if scope.in_scope(u)}
+                candidates |= in_scope_rjs
+                coverage["techniques"]["render_js"] = len(in_scope_rjs)
+                coverage["techniques"]["render_status"] = rstatus
+                _vlog(cfg, f"render: browser loaded {len(rjs)} JS "
+                           f"({len(in_scope_rjs)} in-scope), status={rstatus}")
 
         # --- 3. Opportunistic Go-tool bridge ---
         try:
@@ -2285,6 +2366,17 @@ def _t_cli():
     assert _normalize_domain("https://sub.EXAMPLE.com/path?x=1") == "sub.example.com"
 
 
+@selftest("render.flags_and_graceful_absence")
+def _t_render():
+    ns = build_argparser().parse_args(["x.com", "--render", "--render-pages", "10"])
+    cfg = Config.from_args(ns)
+    assert cfg.render is True and cfg.render_pages == 10
+    # when playwright is absent, render_pages degrades cleanly (never raises)
+    if not HAVE_PLAYWRIGHT:
+        js, status = _run(render_pages(cfg, Scope("x.com"), ["https://x.com/"]))
+        assert js == set() and "not installed" in status
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
@@ -2299,6 +2391,8 @@ def cmd_check_deps() -> int:
     print("  tldextract    :", "yes" if HAVE_TLDEXTRACT else "no (fallback: builtin TLD heuristic)")
     print("  beautifulsoup4:", "yes" if HAVE_BS4 else "no (fallback: regex HTML parsing)")
     print("  rich          :", "yes" if HAVE_RICH else "no (plain output)")
+    print("  playwright    :", "yes (--render available)" if HAVE_PLAYWRIGHT
+          else "no (--render needs: pip install playwright && playwright install chromium)")
     for tool in ("katana", "gau", "subfinder", "subjs", "waybackurls"):
         print(f"  {tool:<14}:", "on PATH" if shutil.which(tool) else "absent (native fallback)")
     return 0
@@ -2345,6 +2439,11 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="actively validate discovered secrets (opt-in; hits 3rd parties)")
     g2.add_argument("--rebuild-src", dest="rebuild_src", action="store_true",
                     help="write source-map original sources to disk")
+    g2.add_argument("--render", action="store_true",
+                    help="headless-browser mode: load pages in Chromium and capture "
+                         "runtime-loaded JS (exact Network-tab parity; needs playwright)")
+    g2.add_argument("--render-pages", dest="render_pages", type=int, default=25,
+                    help="max pages to open in the browser when --render (default 25)")
     # engine
     g3 = p.add_argument_group("engine")
     g3.add_argument("--concurrency", type=int, default=20, help="max in-flight requests (default 20)")

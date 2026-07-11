@@ -6,3 +6,5 @@ requests         # secondary HTTP backend
 tldextract       # accurate apex/subdomain parsing (falls back to builtin heuristic)
 beautifulsoup4   # robust HTML parsing (falls back to regex)
 rich             # prettier console output (falls back to plain)
+playwright       # ONLY for --render (headless-browser mode). After installing:
+                 #   playwright install chromium

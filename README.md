@@ -40,6 +40,7 @@ python godjs.py example.com --no-subs       # exact host only
 python godjs.py example.com --scope scope.txt   # explicit in-scope host list
 python godjs.py example.com --validate      # actively prove discovered secrets (opt-in)
 python godjs.py example.com --rebuild-src   # write original source-map sources to disk
+python godjs.py example.com --render        # headless browser: capture runtime-loaded JS (Network-tab parity)
 python godjs.py example.com --proxy http://127.0.0.1:8080 --header 'Cookie: session=...'
 python godjs.py --check-deps                # what's available on this machine
 python godjs.py --selftest                  # run built-in offline tests (21 checks)
@@ -54,6 +55,24 @@ Output lands in `./godjs_out/<domain>/`:
 - `js_urls.txt` — clean, deduped, sorted URL list
 - `results.json` — full per-file metadata + coverage summary
 - `report.html` — self-contained ranked report
+
+## Exact browser (DevTools Network tab) parity: `--render`
+
+By default GodJsGlitch does **static** discovery (fetch + parse + chunk reconstruction),
+which finds all `<script src>` bundles plus hidden lazy chunks and historical JS. It does
+**not** execute JavaScript, so purely runtime-injected scripts can be missed.
+
+`--render` closes that gap: it drives **headless Chromium (Playwright)**, loads each page,
+and captures every JS the browser actually loads — exactly like the DevTools Network tab —
+then runs the normal secret/endpoint analysis on them.
+
+```bash
+pip install playwright && playwright install chromium   # one-time
+python godjs.py example.com --render --render-pages 25
+```
+
+It's slower (a real browser per page), so it opens the top `--render-pages` seeds
+(homepage + subdomain roots). Combine with `--proxy`/`--header` to render authenticated pages.
 
 ## Found 0 files?
 
