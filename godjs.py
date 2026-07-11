@@ -1001,6 +1001,152 @@ def _t_jsinjs():
     assert "https://x.com/static/lazy.js" in s and "https://x.com/static/dyn.js" in s, s
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Passive sources (historical/deleted JS + subdomains)
+#   Pure parsers are unit-tested; async fetchers wrap engine + parser, guarded.
+# ----------------------------------------------------------------------------
+def parse_wayback_cdx(text: str) -> "set[str]":
+    """Parse Wayback CDX JSON (fl=original) into a set of JS URLs."""
+    out: "set[str]" = set()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return out
+    if not isinstance(data, list):
+        return out
+    for i, row in enumerate(data):
+        if i == 0 and isinstance(row, list) and "original" in row:
+            continue
+        url = row[0] if isinstance(row, list) and row else (row if isinstance(row, str) else None)
+        if url and looks_like_js_url(url):
+            out.add(canonicalize_url(url))
+    return out
+
+
+def parse_otx(text: str) -> "set[str]":
+    """Parse AlienVault OTX url_list JSON into a set of JS URLs."""
+    out: "set[str]" = set()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return out
+    for item in (data.get("url_list") or []):
+        u = item.get("url") if isinstance(item, dict) else None
+        if u and looks_like_js_url(u):
+            out.add(canonicalize_url(u))
+    return out
+
+
+def parse_urlscan(text: str) -> "set[str]":
+    """Parse URLScan.io search JSON into a set of JS URLs."""
+    out: "set[str]" = set()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return out
+    for r in (data.get("results") or []):
+        page = r.get("page") or {} if isinstance(r, dict) else {}
+        u = page.get("url")
+        if u and looks_like_js_url(u):
+            out.add(canonicalize_url(u))
+    return out
+
+
+def parse_commoncrawl(text: str) -> "set[str]":
+    """Parse Common Crawl index JSONL into a set of JS URLs."""
+    out: "set[str]" = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        u = obj.get("url") if isinstance(obj, dict) else None
+        if u and looks_like_js_url(u):
+            out.add(canonicalize_url(u))
+    return out
+
+
+def parse_crtsh(text: str) -> "set[str]":
+    """Parse crt.sh JSON into a set of hostnames (subdomains)."""
+    out: "set[str]" = set()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return out
+    for row in (data if isinstance(data, list) else []):
+        nv = row.get("name_value", "") if isinstance(row, dict) else ""
+        for name in str(nv).split("\n"):
+            name = name.strip().lstrip("*.").lower()
+            if name and "." in name and " " not in name:
+                out.add(name)
+    return out
+
+
+async def source_wayback(engine: HttpEngine, domain: str) -> "set[str]":
+    url = (f"http://web.archive.org/cdx/search/cdx?url=*.{domain}/*"
+           f"&output=json&fl=original&collapse=urlkey&limit=50000")
+    r = await engine.get(url)
+    return parse_wayback_cdx(r.text) if (not r.error and r.text) else set()
+
+
+async def source_otx(engine: HttpEngine, domain: str) -> "set[str]":
+    out: "set[str]" = set()
+    for page in (1, 2, 3):
+        r = await engine.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list?limit=500&page={page}")
+        if r.error or not r.text:
+            break
+        got = parse_otx(r.text)
+        if not got:
+            break
+        out |= got
+    return out
+
+
+async def source_urlscan(engine: HttpEngine, domain: str) -> "set[str]":
+    r = await engine.get(f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=1000")
+    return parse_urlscan(r.text) if (not r.error and r.text) else set()
+
+
+async def source_commoncrawl(engine: HttpEngine, domain: str) -> "set[str]":
+    r = await engine.get("https://index.commoncrawl.org/collinfo.json")
+    if r.error or not r.text:
+        return set()
+    try:
+        idx = json.loads(r.text)
+    except Exception:
+        return set()
+    if not idx or not isinstance(idx, list):
+        return set()
+    api = idx[0].get("cdx-api")
+    if not api:
+        return set()
+    r2 = await engine.get(f"{api}?url=*.{domain}&output=json&fl=url&limit=50000")
+    return parse_commoncrawl(r2.text) if (not r2.error and r2.text) else set()
+
+
+async def source_crtsh(engine: HttpEngine, domain: str) -> "set[str]":
+    r = await engine.get(f"https://crt.sh/?q=%25.{domain}&output=json")
+    return parse_crtsh(r.text) if (not r.error and r.text) else set()
+
+
+@selftest("sources.parsers")
+def _t_src():
+    assert "https://x.com/a.js" in parse_wayback_cdx(
+        '[["original"],["https://x.com/a.js"],["https://x.com/b.css"]]')
+    assert "https://x.com/o.js" in parse_otx(
+        '{"url_list":[{"url":"https://x.com/o.js"},{"url":"https://x.com/o.png"}]}')
+    assert "https://x.com/u.js" in parse_urlscan(
+        '{"results":[{"page":{"url":"https://x.com/u.js"}}]}')
+    assert "https://x.com/c.js" in parse_commoncrawl(
+        '{"url":"https://x.com/c.js"}\n{"url":"https://x.com/c.png"}')
+    assert "cdn.x.com" in parse_crtsh('[{"name_value":"cdn.x.com\\nx.com"}]')
+    assert "x.com" in parse_crtsh('[{"name_value":"*.x.com"}]')
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
