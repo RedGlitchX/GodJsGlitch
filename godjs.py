@@ -196,6 +196,129 @@ def _t_harness():
         stop()
 
 
+# ----------------------------------------------------------------------------
+# SECTION: URL canonicalization, JS detection, Scope guardrails
+# ----------------------------------------------------------------------------
+_JS_RE = re.compile(r"\.(m?js|jsx|cjs)(\?|#|$)", re.I)
+_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+# Common multi-label public suffixes so apex parsing works without tldextract.
+_MULTI_TLDS = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk",
+    "co.jp", "or.jp", "ne.jp", "gr.jp", "ac.jp",
+    "co.in", "co.kr", "co.za", "co.nz", "co.id", "co.th", "co.il",
+    "com.au", "net.au", "org.au", "com.br", "com.co", "com.mx", "com.ar",
+    "com.tr", "com.cn", "com.tw", "com.hk", "com.sg", "com.my", "com.sa",
+    "com.eg", "com.ng", "com.ua", "com.pk", "com.ph", "com.vn",
+}
+
+
+def looks_like_js_url(u: str) -> bool:
+    """True if the URL path looks like a JavaScript resource."""
+    path = urllib.parse.urlsplit(u).path
+    return bool(_JS_RE.search(path))
+
+
+def canonicalize_url(u: str, base: "Optional[str]" = None) -> str:
+    """Absolutize (against base), lowercase host, drop default port + fragment."""
+    u = u.strip()
+    if base:
+        u = urllib.parse.urljoin(base, u)
+    parts = urllib.parse.urlsplit(u)
+    scheme = (parts.scheme or "http").lower()
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        netloc = f"{host}:{port}"
+    else:
+        netloc = host
+    return urllib.parse.urlunsplit((scheme, netloc, parts.path or "", parts.query, ""))
+
+
+def apex_of(host: str) -> str:
+    """Return the registrable apex domain for a host (or the host itself for IPs)."""
+    host = host.lower().strip(".")
+    if not host or _IP_RE.match(host):
+        return host
+    if HAVE_TLDEXTRACT:
+        try:
+            ext = tldextract.extract(host)
+            if ext.domain and ext.suffix:
+                return f"{ext.domain}.{ext.suffix}"
+        except Exception:
+            pass
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    if ".".join(labels[-2:]) in _MULTI_TLDS:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+@dataclass
+class Scope:
+    """Apex-scoped guardrail: decides whether a URL is in-scope."""
+    apex: str
+    allow_subs: bool = True
+    oos: set = field(default_factory=set)
+
+    def __post_init__(self):
+        self.apex = apex_of(self.apex)
+        self.oos = {h.lower() for h in self.oos}
+
+    def add_oos(self, host: str) -> None:
+        self.oos.add(host.lower())
+
+    def in_scope(self, url: str) -> bool:
+        host = _host(url).lower()
+        if not host or host in self.oos:
+            return False
+        if host == self.apex:
+            return True
+        if self.allow_subs and host.endswith("." + self.apex):
+            return True
+        return False
+
+
+@selftest("url.canonicalize")
+def _t_canon():
+    assert canonicalize_url("app.js", "https://x.com/a/b") == "https://x.com/a/app.js"
+    assert canonicalize_url("https://X.com:443/p?q=1#f") == "https://x.com/p?q=1"
+    assert canonicalize_url("/y.js", "https://x.com/a/b") == "https://x.com/y.js"
+    # idempotent
+    once = canonicalize_url("https://X.com:8080/A?b=1#c")
+    assert canonicalize_url(once) == once == "https://x.com:8080/A?b=1"
+
+
+@selftest("url.looks_like_js")
+def _t_js():
+    assert looks_like_js_url("https://x.com/a.js?v=2")
+    assert looks_like_js_url("https://x.com/a.chunk.mjs")
+    assert looks_like_js_url("https://x.com/path/to/bundle.cjs")
+    assert not looks_like_js_url("https://x.com/a.css")
+    assert not looks_like_js_url("https://x.com/a.json")
+
+
+@selftest("scope.apex_and_membership")
+def _t_scope():
+    assert apex_of("a.b.example.co.uk") == "example.co.uk"
+    assert apex_of("cdn.example.com") == "example.com"
+    assert apex_of("127.0.0.1") == "127.0.0.1"
+    s = Scope("example.com", allow_subs=True)
+    assert s.in_scope("https://cdn.example.com/x.js")
+    assert s.in_scope("https://example.com/x.js")
+    assert not s.in_scope("https://evil.com/x.js")
+    assert not s.in_scope("https://notexample.com/x.js")
+    s2 = Scope("example.com", allow_subs=False)
+    assert not s2.in_scope("https://cdn.example.com/x.js")
+    assert s2.in_scope("https://example.com/x.js")
+    s.add_oos("cdn.example.com")
+    assert not s.in_scope("https://cdn.example.com/x.js")
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
