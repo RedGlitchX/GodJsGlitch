@@ -516,6 +516,96 @@ def _t_http():
         stop()
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Prober (liveness/metadata, real-JS sniffing, content-hash dedup)
+# ----------------------------------------------------------------------------
+def _header(headers: dict, name: str) -> str:
+    name = name.lower()
+    for k, v in (headers or {}).items():
+        if k.lower() == name:
+            return v
+    return ""
+
+
+@dataclass
+class FileRecord:
+    url: str
+    sources: set
+    http_status: "Optional[int]"
+    content_type: str
+    bytes: int
+    sha256: str
+    is_js: bool
+    text: str
+    revealed_sources: list = field(default_factory=list)
+    sourcemap_url: "Optional[str]" = None
+    secrets: list = field(default_factory=list)
+    endpoints: list = field(default_factory=list)
+    score: float = 0.0
+    validated: list = field(default_factory=list)
+
+
+def is_real_js(content_type: str, body_head: str, url: str = "") -> bool:
+    """Decide if a fetched resource is genuinely JavaScript (not HTML masquerading)."""
+    ct = (content_type or "").lower()
+    if "javascript" in ct or "ecmascript" in ct:
+        return True
+    head = (body_head or "").lstrip().lower()[:200]
+    if head.startswith("<!doctype") or head.startswith("<html") or head.startswith("<head"):
+        return False
+    if looks_like_js_url(url):
+        if ct.startswith("text/html"):
+            return False
+        return True
+    return False
+
+
+class Prober:
+    """Fetches a candidate, records metadata, dedups by content hash."""
+
+    def __init__(self, engine: HttpEngine):
+        self.engine = engine
+        self.seen_hashes: set = set()
+
+    async def probe(self, url: str, via: str) -> "Optional[FileRecord]":
+        r = await self.engine.get(url)
+        if r.error or r.status is None or r.status != 200:
+            return None
+        body = r.content if r.content else (r.text or "").encode("utf-8", "replace")
+        sha = hashlib.sha256(body).hexdigest()
+        if sha in self.seen_hashes:
+            return None
+        self.seen_hashes.add(sha)
+        ctype = _header(r.headers, "content-type")
+        isjs = is_real_js(ctype, r.text or "", url)
+        return FileRecord(url, {via}, r.status, ctype, len(body), sha, isjs, r.text or "")
+
+
+@selftest("prober.detect_and_dedup")
+def _t_probe():
+    base, stop = _serve({
+        "/real.js": ("application/javascript", b"export const x=1"),
+        "/dupe.js": ("application/javascript", b"export const x=1"),   # same body -> dedup
+        "/fake.js": ("text/html", b"<!doctype html><html></html>"),
+    })
+
+    async def go():
+        p = Prober(HttpEngine(Config.defaults()))
+        r1 = await p.probe(base + "/real.js", "test")
+        r2 = await p.probe(base + "/dupe.js", "test")
+        r3 = await p.probe(base + "/fake.js", "test")
+        await p.engine.close()
+        return r1, r2, r3
+
+    try:
+        r1, r2, r3 = _run(go())
+        assert r1 is not None and r1.is_js and r1.sha256
+        assert r2 is None                       # deduped by content hash
+        assert r3 is not None and not r3.is_js   # HTML served at .js -> not JS
+    finally:
+        stop()
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
