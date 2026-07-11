@@ -684,6 +684,233 @@ def _t_smap():
     assert "inline.ts" in text
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Webpack / Vite / Next chunk-graph reconstruction (hidden chunks)
+# ----------------------------------------------------------------------------
+_PP_RE = re.compile(r"\.p\s*=\s*[\"']([^\"']*)[\"']")
+
+
+def _balanced(s: str, i: int) -> "Optional[str]":
+    """Given s[i] == '{', return the inner text of the balanced {...} (quote-aware)."""
+    if i < 0 or i >= len(s) or s[i] != "{":
+        return None
+    depth = 0
+    quote = None
+    j = i
+    while j < len(s):
+        c = s[j]
+        if quote:
+            if c == quote and s[j - 1] != "\\":
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[i + 1:j]
+        j += 1
+    return None
+
+
+def _read_expr(s: str) -> str:
+    """Read an expression up to the first top-level ';' (quote/bracket aware)."""
+    depth = 0
+    quote = None
+    for j, c in enumerate(s):
+        if quote:
+            if c == quote and s[j - 1] != "\\":
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            return s[:j]
+    return s
+
+
+def _split_top_plus(expr: str) -> "list[str]":
+    """Split a JS concatenation expression on top-level '+' (quote/bracket aware)."""
+    parts = []
+    depth = 0
+    quote = None
+    cur = ""
+    i = 0
+    while i < len(expr):
+        c = expr[i]
+        if quote:
+            cur += c
+            if c == quote and expr[i - 1] != "\\":
+                quote = None
+        elif c in "\"'":
+            quote = c
+            cur += c
+        elif c in "([{":
+            depth += 1
+            cur += c
+        elif c in ")]}":
+            depth -= 1
+            cur += c
+        elif c == "+" and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    parts.append(cur)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _find_u_template(js: str):
+    """Locate webpack's chunk-URL template `.u`. Returns (param, return_expr)."""
+    for m in re.finditer(r"\.u\s*=\s*function\s*\(([^)]*)\)\s*\{", js):
+        param = m.group(1).strip().split(",")[0].strip()
+        body = _balanced(js, m.end() - 1)
+        if body is None:
+            continue
+        mm = re.match(r"\s*return\s*(.*)", body.strip(), re.S)
+        return param, (mm.group(1) if mm else body).strip()
+    for m in re.finditer(r"\.u\s*=\s*\(?([A-Za-z_$][\w$]*)\)?\s*=>\s*", js):
+        param = m.group(1)
+        rest = js[m.end():]
+        if rest.lstrip().startswith("{"):
+            body = _balanced(rest, rest.index("{")) or ""
+            mm = re.search(r"return\s*(.*)", body.strip(), re.S)
+            expr = (mm.group(1) if mm else body).strip()
+        else:
+            expr = _read_expr(rest).strip()
+        return param, expr
+    return None, None
+
+
+def _find_chunk_hashmap(text: str) -> dict:
+    """Find a `{id:"hash", ...}` object literal (numeric keys -> string values)."""
+    for m in re.finditer(r"\{([^{}]*)\}", text):
+        inner = m.group(1)
+        if not inner.strip() or ":" not in inner:
+            continue
+        pairs = re.findall(r'(\d+)\s*:\s*"([^"]*)"', inner)
+        if not pairs:
+            pairs = re.findall(r"(\d+)\s*:\s*'([^']*)'", inner)
+        if pairs and len(pairs) == inner.count(":"):
+            return {int(k): v for k, v in pairs}
+    return {}
+
+
+def _eval_term(term: str, param: str, cid: int, hashmap: dict) -> str:
+    term = term.strip()
+    if len(term) >= 2 and term[0] in "\"'" and term[-1] == term[0]:
+        return term[1:-1]
+    if term == param:
+        return str(cid)
+    if re.search(r"\[\s*" + re.escape(param) + r"\s*\]\s*$", term):
+        return str(hashmap.get(cid, cid))
+    if param in term and hashmap.get(cid):
+        return str(hashmap.get(cid))
+    if re.fullmatch(r"\d+", term):
+        return term
+    return ""
+
+
+def reconstruct_webpack_chunks(js_text: str, base: str) -> "set[str]":
+    """Reconstruct every lazy webpack chunk URL from the runtime bundle."""
+    urls: "set[str]" = set()
+    try:
+        pp_m = _PP_RE.search(js_text)
+        pp = pp_m.group(1) if pp_m else ""
+        param, expr = _find_u_template(js_text)
+        if not expr or not param:
+            return urls
+        hashmap = _find_chunk_hashmap(expr) or _find_chunk_hashmap(js_text)
+        if not hashmap:
+            return urls
+        terms = _split_top_plus(expr)
+        for cid in hashmap:
+            out = "".join(_eval_term(t, param, cid, hashmap) for t in terms)
+            if out:
+                urls.add(canonicalize_url(pp + out, base))
+    except Exception:
+        pass
+    return urls
+
+
+def parse_asset_manifest(json_text: str, base: str) -> "set[str]":
+    """Parse a CRA-style asset-manifest.json / chunk-manifest.json for JS URLs."""
+    urls: "set[str]" = set()
+    try:
+        data = json.loads(json_text)
+    except Exception:
+        return urls
+
+    def walk(v):
+        if isinstance(v, str):
+            if v.endswith(".js") or looks_like_js_url(v):
+                urls.add(canonicalize_url(v, base))
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(data)
+    return urls
+
+
+def parse_vite_manifest(json_text: str, base: str) -> "set[str]":
+    """Parse a Vite .vite/manifest.json for emitted JS files."""
+    urls: "set[str]" = set()
+    try:
+        data = json.loads(json_text)
+    except Exception:
+        return urls
+    if isinstance(data, dict):
+        for entry in data.values():
+            if isinstance(entry, dict):
+                for key in ("file", "src"):
+                    v = entry.get(key)
+                    if isinstance(v, str) and v.endswith(".js"):
+                        urls.add(canonicalize_url(v, base))
+    return urls
+
+
+def parse_next_build_manifest(js_text: str, base: str) -> "set[str]":
+    """Parse Next.js _buildManifest.js / any manifest-ish JS for chunk paths."""
+    urls: "set[str]" = set()
+    for m in re.finditer(r'["\']([^"\']+\.js)["\']', js_text):
+        p = m.group(1)
+        if p.startswith("static/"):
+            urls.add(canonicalize_url("/_next/" + p, base))
+        else:
+            urls.add(canonicalize_url(p, base))
+    return urls
+
+
+@selftest("webpack.reconstruct")
+def _t_wp():
+    runtime = ('a.p="/static/";t.u=function(e){return"js/"+e+"."+'
+               '{12:"deadbeef",7:"c0ffee"}[e]+".chunk.js"}')
+    urls = reconstruct_webpack_chunks(runtime, "https://x.com/static/js/main.js")
+    assert "https://x.com/static/js/12.deadbeef.chunk.js" in urls, urls
+    assert "https://x.com/static/js/7.c0ffee.chunk.js" in urls, urls
+
+
+@selftest("manifest.asset_vite_next")
+def _t_mani():
+    assert "https://x.com/static/js/2.abc.chunk.js" in parse_asset_manifest(
+        '{"files":{"static/js/2.abc.chunk.js":"/static/js/2.abc.chunk.js"}}',
+        "https://x.com/asset-manifest.json")
+    assert any("index.9f.js" in u for u in parse_vite_manifest(
+        '{"index.html":{"file":"assets/index.9f.js"}}', "https://x.com/.vite/manifest.json"))
+    assert any(".js" in u for u in parse_next_build_manifest(
+        'self.__BUILD_MANIFEST={"/":["static/chunks/pages/index-1.js"]}',
+        "https://x.com/_next/static/x/_buildManifest.js"))
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
