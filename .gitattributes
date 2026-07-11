@@ -1,0 +1,6 @@
+# Force LF line endings so scripts run on Linux regardless of clone platform.
+# (A CRLF shebang breaks: "/usr/bin/env bash^M: bad interpreter".)
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf

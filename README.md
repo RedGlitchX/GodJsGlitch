@@ -23,29 +23,55 @@ they happen to be on your PATH.
   right 5 of 500 files first.
 - **Zero required dependencies**; opportunistic **Go-tool bridge**; proxy / auth-header support.
 
-## Install
+## Requirements
 
-Nothing required. For best performance:
+- **Linux** (built and tested on Kali/Debian; the core also runs anywhere Python does).
+- **Python 3.9+**. Zero mandatory Python packages — it degrades to the stdlib.
+
+## Install (Linux)
+
+The core tool needs nothing installed:
 
 ```bash
-pip install -r requirements.txt   # all optional
+git clone https://github.com/RedGlitchX/GodJsGlitch.git
+cd GodJsGlitch
+chmod +x godjs.py
+./godjs.py example.com --verbose
+```
+
+For **all features** (faster HTTP, accurate scoping, and `--render`), use the setup script.
+It builds a self-contained venv and installs Playwright via pip (which bundles its own
+Node.js — avoiding Kali's `apt python3-playwright` missing-node problem):
+
+```bash
+./setup.sh --all          # core + Playwright/Chromium + subfinder/katana
+# or pick what you want:
+./setup.sh                # core deps only (httpx, tldextract, bs4, rich)
+./setup.sh --with-render  # + Playwright + Chromium (for --render)
+./setup.sh --with-tools   # + subfinder / katana (recon bridge)
+
+source .venv/bin/activate
+./godjs.py --check-deps
 ```
 
 ## Usage
 
 ```bash
-python godjs.py example.com                 # full hunt (discovery + analysis)
-python godjs.py example.com --passive       # archives only, no active crawl
-python godjs.py example.com --no-subs       # exact host only
-python godjs.py example.com --scope scope.txt   # explicit in-scope host list
-python godjs.py example.com --validate      # actively prove discovered secrets (opt-in)
-python godjs.py example.com --rebuild-src   # write original source-map sources to disk
-python godjs.py example.com --render        # headless browser: capture runtime-loaded JS (Network-tab parity)
-python godjs.py example.com --proxy http://127.0.0.1:8080 --header 'Cookie: session=...'
-python godjs.py --check-deps                # what's available on this machine
-python godjs.py --selftest                  # run built-in offline tests (21 checks)
-python godjs.py -h                          # all flags
+./godjs.py example.com                 # full hunt (discovery + analysis)
+./godjs.py example.com --render        # headless browser: capture runtime-loaded JS (Network-tab parity)
+./godjs.py example.com --validate      # actively prove discovered secrets (opt-in)
+./godjs.py example.com --no-subs       # exact host only
+./godjs.py example.com --scope scope.txt   # explicit in-scope host list
+./godjs.py example.com --rebuild-src   # write original source-map sources to disk
+./godjs.py example.com --passive       # archives only, no active crawl (supplement)
+./godjs.py example.com --proxy http://127.0.0.1:8080 --header 'Cookie: session=...'
+./godjs.py --check-deps                # what's available on this machine
+./godjs.py --selftest                  # run built-in offline tests
+./godjs.py -h                          # all flags
 ```
+
+> If you used `setup.sh`, activate the venv first (`source .venv/bin/activate`) — otherwise
+> `--render` and the optional speed-ups won't be picked up.
 
 Every network phase is time-bounded: `--timeout` caps each request, `--passive-timeout`
 caps the whole passive-archive phase, and DNS-dead hosts are never retried — a slow or

@@ -16,11 +16,13 @@ Design goals:
     else stdlib urllib. Optional rich/tldextract/bs4 used only if importable.
   * No Go tools required. katana/gau/subfinder/subjs used only if on PATH.
 
+Built for Linux (Kali/Debian). Runs anywhere Python 3.9+ runs; use ./setup.sh on Linux.
+
 Usage:
-  python godjs.py example.com
-  python godjs.py example.com --passive --validate --rebuild-src
-  python godjs.py --check-deps
-  python godjs.py --selftest
+  ./godjs.py example.com
+  ./godjs.py example.com --render --validate --verbose
+  ./godjs.py --check-deps
+  ./godjs.py --selftest
 
 Authorized security testing only.
 """

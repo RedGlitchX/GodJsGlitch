@@ -2,4 +2,5 @@ godjs_out/
 __pycache__/
 *.pyc
 .venv/
+venv/
 *.log
