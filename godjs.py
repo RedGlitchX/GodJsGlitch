@@ -345,7 +345,7 @@ class Config:
     passive: bool = False
     depth: int = 2
     max_urls: int = 5000
-    max_pages: int = 100
+    max_pages: int = 300
     concurrency: int = 20
     rate: float = 10.0            # max requests/sec per host
     timeout: float = 15.0
@@ -379,6 +379,7 @@ class Config:
             passive=ns.passive,
             depth=ns.depth,
             max_urls=ns.max_urls,
+            max_pages=ns.max_pages,
             concurrency=ns.concurrency,
             rate=ns.rate,
             timeout=ns.timeout,
@@ -424,7 +425,18 @@ class HttpEngine:
             self.backend = "urllib"
 
     def _headers(self) -> dict:
-        h = {"User-Agent": self.cfg.ua, "Accept": "*/*"}
+        # Browser-like headers reduce trivial WAF/bot 403s on protected sites.
+        h = {
+            "User-Agent": self.cfg.ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                      "image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
         h.update(self.cfg.headers or {})
         return h
 
@@ -1283,6 +1295,7 @@ class Spider:
         self.engine = engine
         self.scope = scope
         self.cfg = cfg
+        self.host_stats: dict = {}   # host -> {"codes": {code: n}, "js": n}
 
     async def crawl(self, seeds: "list[str]"):
         js_urls: "set[str]" = set()
@@ -1307,16 +1320,25 @@ class Spider:
                                            return_exceptions=True)
             next_frontier: "list[str]" = []
             for u, r in zip(batch, results):
-                if isinstance(r, Exception) or r.error or r.status != 200:
+                host = _host(u)
+                hs = self.host_stats.setdefault(host, {"codes": {}, "js": 0})
+                if isinstance(r, Exception):
+                    hs["codes"]["error"] = hs["codes"].get("error", 0) + 1
+                    continue
+                if r.error:
+                    k = "timeout" if ("timeout" in r.error.lower() or "timed out" in r.error.lower()) else "error"
+                    hs["codes"][k] = hs["codes"].get(k, 0) + 1
+                    continue
+                hs["codes"][str(r.status)] = hs["codes"].get(str(r.status), 0) + 1
+                if r.status != 200:
                     continue
                 pages += 1
                 text = r.text or ""
-                for j in extract_scripts_from_html(text, u):
-                    if self.scope.in_scope(j):
-                        js_urls.add(j)
-                for j in extract_js_links(text, u):
-                    if looks_like_js_url(j) and self.scope.in_scope(j):
-                        js_urls.add(j)
+                page_js = {j for j in extract_scripts_from_html(text, u) if self.scope.in_scope(j)}
+                page_js |= {j for j in extract_js_links(text, u)
+                            if looks_like_js_url(j) and self.scope.in_scope(j)}
+                js_urls |= page_js
+                hs["js"] += len(page_js)
                 ctype = _header(r.headers, "content-type")
                 if "html" in ctype.lower() or "<" in text[:200]:
                     body = r.content or text.encode("utf-8", "replace")
@@ -1952,6 +1974,21 @@ def _vlog(cfg: Config, msg: str) -> None:
         print(f"[godjsglitch]   {msg}", file=sys.stderr)
 
 
+def _host_summary(hs: dict) -> str:
+    """One-line outcome for a crawled host: '200 (N js)' / '403' / 'timeout' / ..."""
+    codes = hs.get("codes", {})
+    if "200" in codes:
+        return f"200 ({hs.get('js', 0)} js)"
+    for pref in ("403", "401", "429", "503", "500", "302", "301"):
+        if pref in codes:
+            return pref
+    if "timeout" in codes:
+        return "timeout"
+    if "error" in codes:
+        return "error/unreachable"
+    return ",".join(sorted(codes)) or "no-response"
+
+
 def _is_local_host(host: str) -> bool:
     host = (host or "").lower()
     if host in ("localhost", "127.0.0.1", "::1"):
@@ -2056,7 +2093,7 @@ class Orchestrator:
         seeds = list(cfg.seeds) if cfg.seeds else [
             f"https://{cfg.domain}/", f"http://{cfg.domain}/"]
         if cfg.allow_subs:
-            seeds += ["https://" + s + "/" for s in list(subdomains)[:100]]
+            seeds += ["https://" + s + "/" for s in list(subdomains)[:200]]
         seeds += list(passive_pages)[:300]
         if not cfg.passive:
             _vlog(cfg, f"crawl: {len(set(seeds))} seed URLs "
@@ -2066,7 +2103,23 @@ class Orchestrator:
             candidates |= {u for u in js_from_crawl if scope.in_scope(u)}
             coverage["techniques"]["crawl_js"] = len(js_from_crawl)
             coverage["techniques"]["html_pages_crawled"] = len(html_records)
-            _vlog(cfg, f"crawl: found {len(js_from_crawl)} JS from {len(html_records)} pages")
+            # per-host breakdown: which subdomains served JS, which were blocked/dead
+            host_report = {h: _host_summary(hs) for h, hs in spider.host_stats.items()}
+            coverage["crawl_hosts"] = dict(sorted(host_report.items()))
+            js_hosts = sorted(((h, hs["js"]) for h, hs in spider.host_stats.items() if hs["js"]),
+                              key=lambda x: -x[1])
+            blocked = [h for h, s in host_report.items() if s in ("403", "401", "429")]
+            coverage["techniques"]["hosts_crawled"] = len(host_report)
+            coverage["techniques"]["hosts_with_js"] = len(js_hosts)
+            coverage["techniques"]["hosts_blocked_4xx"] = len(blocked)
+            _vlog(cfg, f"crawl: found {len(js_from_crawl)} JS from {len(html_records)} pages "
+                       f"across {len(host_report)} hosts")
+            _vlog(cfg, f"crawl: JS on {len(js_hosts)} hosts, {len(blocked)} blocked(4xx), "
+                       f"{sum(1 for s in host_report.values() if s in ('timeout', 'error/unreachable'))} dead")
+            for h, n in js_hosts[:25]:
+                _vlog(cfg, f"    JS host: {h} -> {n}")
+            if blocked:
+                _vlog(cfg, f"    blocked (WAF/auth?): {', '.join(sorted(blocked)[:20])}")
         else:
             _vlog(cfg, f"passive mode: skipping crawl ({len(passive_pages)} page-seeds unused; "
                        f"run without --passive to crawl them for live JS)")
@@ -2282,6 +2335,8 @@ def build_argparser() -> argparse.ArgumentParser:
     g1.add_argument("--depth", type=int, default=2, help="crawl depth (default 2)")
     g1.add_argument("--max-urls", dest="max_urls", type=int, default=5000,
                     help="hard cap on total candidates (default 5000)")
+    g1.add_argument("--max-pages", dest="max_pages", type=int, default=300,
+                    help="max HTML pages to crawl, e.g. subdomain homepages (default 300)")
     # analysis
     g2 = p.add_argument_group("analysis")
     g2.add_argument("--no-analyze", dest="no_analyze", action="store_true",
@@ -2359,6 +2414,15 @@ def main(argv=None) -> int:
         for r in top:
             tags = ",".join(sorted({s.type for s in r.secrets})) if r.secrets else ""
             print(f"   {r.score:6.1f}  {r.url}  {tags}")
+
+    tech = state.coverage.get("techniques", {})
+    if tech.get("hosts_crawled"):
+        print(f"[godjsglitch] crawl reach: {tech.get('hosts_with_js', 0)} hosts with JS, "
+              f"{tech.get('hosts_blocked_4xx', 0)} blocked(4xx) of {tech['hosts_crawled']} crawled "
+              f"(per-host breakdown in results.json -> coverage.crawl_hosts)")
+    if tech.get("hosts_blocked_4xx"):
+        print("[godjsglitch] note: some subdomains returned 4xx (WAF or auth-gated). To reach them, "
+              "re-run with a real browser session: --header 'Cookie: <session>' [--proxy http://127.0.0.1:8080]")
 
     # When nothing turned up, explain WHY (provider status) and how to fix it.
     if n == 0:
