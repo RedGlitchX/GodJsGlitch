@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, asdict
@@ -317,6 +318,202 @@ def _t_scope():
     assert s2.in_scope("https://example.com/x.js")
     s.add_oos("cdn.example.com")
     assert not s.in_scope("https://cdn.example.com/x.js")
+
+
+# ----------------------------------------------------------------------------
+# SECTION: Config + async HttpEngine (httpx -> requests -> urllib fallback)
+# ----------------------------------------------------------------------------
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+@dataclass
+class Config:
+    """Runtime configuration. Expanded/parsed from CLI in Config.from_args (Task 14)."""
+    domain: str = ""
+    seeds: list = field(default_factory=list)
+    allow_subs: bool = True
+    passive: bool = False
+    depth: int = 2
+    max_urls: int = 5000
+    max_pages: int = 100
+    concurrency: int = 20
+    rate: float = 10.0            # max requests/sec per host
+    timeout: float = 15.0
+    retries: int = 2
+    proxy: "Optional[str]" = None
+    headers: dict = field(default_factory=dict)
+    ua: str = DEFAULT_UA
+    validate: bool = False
+    rebuild_src: bool = False
+    no_analyze: bool = False
+    outdir: "Optional[str]" = None
+    scope_file: "Optional[str]" = None
+    json_only: bool = False
+    verbose: int = 0
+
+    @classmethod
+    def defaults(cls) -> "Config":
+        return cls()
+
+
+@dataclass
+class Response:
+    url: str
+    status: "Optional[int]"
+    headers: dict
+    text: str
+    content: bytes
+    error: "Optional[str]"
+    final_url: str
+
+
+class HttpEngine:
+    """Async HTTP with backend fallback, per-host rate limiting, retries, proxy."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._sem = asyncio.Semaphore(max(1, cfg.concurrency))
+        self._host_last: "dict[str, float]" = {}
+        self._host_locks: "dict[str, asyncio.Lock]" = {}
+        self._client = None  # lazy httpx.AsyncClient
+        if HAVE_HTTPX:
+            self.backend = "httpx"
+        elif HAVE_REQUESTS:
+            self.backend = "requests"
+        else:
+            self.backend = "urllib"
+
+    def _headers(self) -> dict:
+        h = {"User-Agent": self.cfg.ua, "Accept": "*/*"}
+        h.update(self.cfg.headers or {})
+        return h
+
+    async def _rate_wait(self, host: str) -> None:
+        if self.cfg.rate <= 0:
+            return
+        lock = self._host_locks.get(host)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._host_locks[host] = lock
+        async with lock:
+            interval = 1.0 / self.cfg.rate
+            now = time.monotonic()
+            wait = interval - (now - self._host_last.get(host, 0.0))
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._host_last[host] = time.monotonic()
+
+    async def _ensure_httpx(self):
+        if self._client is None:
+            kw = dict(verify=False, follow_redirects=True, timeout=self.cfg.timeout)
+            if self.cfg.proxy:
+                try:
+                    self._client = httpx.AsyncClient(proxy=self.cfg.proxy, **kw)
+                except TypeError:
+                    self._client = httpx.AsyncClient(proxies=self.cfg.proxy, **kw)
+            else:
+                self._client = httpx.AsyncClient(**kw)
+        return self._client
+
+    async def _fetch_httpx(self, method: str, url: str) -> Response:
+        client = await self._ensure_httpx()
+        resp = await client.request(method, url, headers=self._headers())
+        text = resp.text if method == "GET" else ""
+        content = resp.content if method == "GET" else b""
+        return Response(url, resp.status_code, dict(resp.headers), text, content, None, str(resp.url))
+
+    def _fetch_requests_sync(self, method: str, url: str) -> Response:
+        try:
+            import urllib3  # type: ignore
+            urllib3.disable_warnings()
+        except Exception:
+            pass
+        proxies = {"http": self.cfg.proxy, "https": self.cfg.proxy} if self.cfg.proxy else None
+        r = requests.request(method, url, headers=self._headers(), timeout=self.cfg.timeout,
+                             allow_redirects=True, verify=False, proxies=proxies)
+        content = r.content if method == "GET" else b""
+        text = r.text if method == "GET" else ""
+        return Response(url, r.status_code, dict(r.headers), text, content, None, r.url)
+
+    def _fetch_urllib_sync(self, method: str, url: str) -> Response:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        handlers = [urllib.request.HTTPSHandler(context=ctx)]
+        if self.cfg.proxy:
+            handlers.append(urllib.request.ProxyHandler(
+                {"http": self.cfg.proxy, "https": self.cfg.proxy}))
+        opener = urllib.request.build_opener(*handlers)
+        req = urllib.request.Request(url, method=method, headers=self._headers())
+        try:
+            with opener.open(req, timeout=self.cfg.timeout) as r:
+                content = r.read() if method == "GET" else b""
+                text = content.decode("utf-8", "replace") if method == "GET" else ""
+                return Response(url, getattr(r, "status", 200), dict(r.headers), text, content, None, r.geturl())
+        except urllib.error.HTTPError as e:
+            body = e.read() if method == "GET" else b""
+            return Response(url, e.code, dict(e.headers or {}),
+                            body.decode("utf-8", "replace"), body, None, url)
+
+    async def _dispatch(self, method: str, url: str) -> Response:
+        if self.backend == "httpx":
+            return await self._fetch_httpx(method, url)
+        if self.backend == "requests":
+            return await asyncio.to_thread(self._fetch_requests_sync, method, url)
+        return await asyncio.to_thread(self._fetch_urllib_sync, method, url)
+
+    async def _request(self, method: str, url: str) -> Response:
+        host = _host(url)
+        async with self._sem:
+            await self._rate_wait(host)
+            last_err = None
+            for attempt in range(self.cfg.retries + 1):
+                try:
+                    return await self._dispatch(method, url)
+                except Exception as e:  # noqa: BLE001 - network error -> retry then record
+                    last_err = e
+                    if attempt < self.cfg.retries:
+                        await asyncio.sleep(0.2 * (attempt + 1))
+            return Response(url, None, {}, "", b"",
+                            f"{type(last_err).__name__}: {last_err}", url)
+
+    async def get(self, url: str) -> Response:
+        return await self._request("GET", url)
+
+    async def head(self, url: str) -> Response:
+        return await self._request("HEAD", url)
+
+    async def close(self) -> None:
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
+
+
+@selftest("http.get_ok_and_error")
+def _t_http():
+    base, stop = _serve({"/a.js": ("application/javascript", b"var a=1;")})
+
+    async def go():
+        eng = HttpEngine(Config.defaults())
+        try:
+            r = await eng.get(base + "/a.js")
+            r2 = await eng.get(base + "/missing")
+            r3 = await eng.get("http://127.0.0.1:1/x")  # closed port
+            return r, r2, r3
+        finally:
+            await eng.close()
+
+    try:
+        r, r2, r3 = _run(go())
+        assert r.status == 200 and "var a=1" in r.text
+        assert r2.status == 404
+        assert r3.error is not None and r3.status is None
+    finally:
+        stop()
 
 
 # @@INSERT_SECTIONS_ABOVE@@
