@@ -1189,10 +1189,28 @@ def _prov_status(r: Response, n: int) -> "tuple[str, str]":
     return ("ok" if n else "empty"), ""
 
 
+async def _get_resilient(engine: HttpEngine, url: str, tries: int = 2) -> Response:
+    """GET with a short retry on TRANSIENT failures (5xx, connection dropped).
+
+    Archive services (web.archive.org, index.commoncrawl.org) frequently return
+    503 or drop the connection under load; a brief backoff often succeeds.
+    """
+    r = None
+    for i in range(tries):
+        r = await engine.get(url)
+        transient = (r.status and r.status >= 500) or (r.error and any(
+            s in r.error.lower() for s in
+            ("disconnect", "protocolerror", "connection reset", "remoteprotocol")))
+        if not transient or i == tries - 1:
+            return r
+        await asyncio.sleep(1.5 * (i + 1))
+    return r
+
+
 async def source_wayback(engine: HttpEngine, domain: str) -> SourceResult:
     url = (f"http://web.archive.org/cdx/search/cdx?url={domain}/*"
            f"&output=text&fl=original&collapse=urlkey&limit=50000")
-    r = await engine.get(url)
+    r = await _get_resilient(engine, url)
     urls = parse_wayback_cdx(r.text) if (not r.error and r.text) else set()
     st, dt = _prov_status(r, len(urls))
     return SourceResult(urls, st, dt)
@@ -1224,7 +1242,7 @@ async def source_urlscan(engine: HttpEngine, domain: str) -> SourceResult:
 
 
 async def source_commoncrawl(engine: HttpEngine, domain: str) -> SourceResult:
-    r = await engine.get("https://index.commoncrawl.org/collinfo.json")
+    r = await _get_resilient(engine, "https://index.commoncrawl.org/collinfo.json")
     if r.error or r.status != 200 or not r.text:
         st, dt = _prov_status(r, 0)
         return SourceResult(set(), st, dt)
@@ -1237,7 +1255,7 @@ async def source_commoncrawl(engine: HttpEngine, domain: str) -> SourceResult:
     api = idx[0].get("cdx-api")
     if not api:
         return SourceResult(set(), "empty", "")
-    r2 = await engine.get(f"{api}?url={domain}/*&output=json&fl=url&limit=50000")
+    r2 = await _get_resilient(engine, f"{api}?url={domain}/*&output=json&fl=url&limit=50000")
     urls = parse_commoncrawl(r2.text) if (not r2.error and r2.text) else set()
     st, dt = _prov_status(r2, len(urls))
     return SourceResult(urls, st, dt)
