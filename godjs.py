@@ -349,7 +349,8 @@ class Config:
     concurrency: int = 20
     rate: float = 10.0            # max requests/sec per host
     timeout: float = 15.0
-    retries: int = 2
+    retries: int = 1
+    passive_budget: float = 45.0  # overall wall-clock cap for passive providers
     proxy: "Optional[str]" = None
     headers: dict = field(default_factory=dict)
     ua: str = DEFAULT_UA
@@ -364,6 +365,35 @@ class Config:
     @classmethod
     def defaults(cls) -> "Config":
         return cls()
+
+    @classmethod
+    def from_args(cls, ns: argparse.Namespace) -> "Config":
+        headers: dict = {}
+        for h in (getattr(ns, "header", None) or []):
+            if ":" in h:
+                k, v = h.split(":", 1)
+                headers[k.strip()] = v.strip()
+        return cls(
+            domain=ns.domain or "",
+            allow_subs=not ns.no_subs,
+            passive=ns.passive,
+            depth=ns.depth,
+            max_urls=ns.max_urls,
+            concurrency=ns.concurrency,
+            rate=ns.rate,
+            timeout=ns.timeout,
+            passive_budget=ns.passive_timeout,
+            proxy=ns.proxy,
+            headers=headers,
+            ua=ns.ua or DEFAULT_UA,
+            validate=ns.validate,
+            rebuild_src=ns.rebuild_src,
+            no_analyze=ns.no_analyze,
+            outdir=ns.outdir,
+            scope_file=ns.scope,
+            json_only=ns.json_only,
+            verbose=ns.verbose,
+        )
 
 
 @dataclass
@@ -472,6 +502,16 @@ class HttpEngine:
             return await asyncio.to_thread(self._fetch_requests_sync, method, url)
         return await asyncio.to_thread(self._fetch_urllib_sync, method, url)
 
+    @staticmethod
+    def _is_dns_error(e: Exception) -> bool:
+        if isinstance(e, socket.gaierror):
+            return True
+        m = str(e).lower()
+        return any(s in m for s in (
+            "getaddrinfo", "name or service not known", "nodename nor servname",
+            "temporary failure in name resolution", "no address associated",
+            "name does not resolve"))
+
     async def _request(self, method: str, url: str) -> Response:
         host = _host(url)
         async with self._sem:
@@ -480,10 +520,12 @@ class HttpEngine:
             for attempt in range(self.cfg.retries + 1):
                 try:
                     return await self._dispatch(method, url)
-                except Exception as e:  # noqa: BLE001 - network error -> retry then record
+                except Exception as e:  # noqa: BLE001 - network error -> maybe retry, then record
                     last_err = e
-                    if attempt < self.cfg.retries:
-                        await asyncio.sleep(0.2 * (attempt + 1))
+                    # retrying a name-resolution failure is pointless and slow
+                    if self._is_dns_error(e) or attempt >= self.cfg.retries:
+                        break
+                    await asyncio.sleep(0.2 * (attempt + 1))
             return Response(url, None, {}, "", b"",
                             f"{type(last_err).__name__}: {last_err}", url)
 
@@ -1855,21 +1897,31 @@ class Orchestrator:
         local = _is_local_host(apex_of(cfg.domain))
 
         # --- 1. Passive archives (skipped for local/IP targets) ---
+        # All providers run concurrently under one wall-clock budget: a slow or
+        # hanging provider can never stall the run - we take whatever finished.
         if not local:
             provs = [("wayback", source_wayback), ("otx", source_otx),
-                     ("urlscan", source_urlscan), ("commoncrawl", source_commoncrawl)]
-            results = await asyncio.gather(*[f(engine, cfg.domain) for _, f in provs],
-                                           return_exceptions=True)
-            for (name, _), res in zip(provs, results):
-                got = res if isinstance(res, set) else set()
-                coverage["providers"][name] = len(got)
-                candidates |= {u for u in got if scope.in_scope(u)}
-            try:
-                subs = await source_crtsh(engine, cfg.domain)
-            except Exception:
-                subs = set()
-            subdomains = {s for s in subs if scope.in_scope("https://" + s + "/")}
-            coverage["providers"]["crtsh_subdomains"] = len(subdomains)
+                     ("urlscan", source_urlscan), ("commoncrawl", source_commoncrawl),
+                     ("crtsh", source_crtsh)]
+            task_name = {asyncio.ensure_future(f(engine, cfg.domain)): name for name, f in provs}
+            done, pending = await asyncio.wait(
+                list(task_name.keys()), timeout=cfg.passive_budget)
+            for t in pending:
+                t.cancel()
+                coverage["providers"][task_name[t]] = "timeout"
+            for t in done:
+                name = task_name[t]
+                try:
+                    res = t.result()
+                except Exception:
+                    res = set()
+                res = res if isinstance(res, set) else set()
+                if name == "crtsh":
+                    subdomains = {s for s in res if scope.in_scope("https://" + s + "/")}
+                    coverage["providers"]["crtsh_subdomains"] = len(subdomains)
+                else:
+                    coverage["providers"][name] = len(res)
+                    candidates |= {u for u in res if scope.in_scope(u)}
 
         # --- 2. Seeds + active crawl ---
         seeds = list(cfg.seeds) if cfg.seeds else [
@@ -2021,6 +2073,26 @@ def _t_orch():
         stop()
 
 
+# ----------------------------------------------------------------------------
+# SECTION: CLI selftest
+# ----------------------------------------------------------------------------
+@selftest("cli.parse_all_flags")
+def _t_cli():
+    ns = build_argparser().parse_args(
+        ["example.com", "--no-subs", "--passive", "--depth", "3", "--validate",
+         "--concurrency", "5", "--proxy", "http://127.0.0.1:8080", "--header", "A: B",
+         "--rebuild-src", "--no-analyze", "--rate", "3", "-o", "out"])
+    cfg = Config.from_args(ns)
+    assert cfg.domain == "example.com"
+    assert cfg.allow_subs is False and cfg.passive and cfg.depth == 3
+    assert cfg.validate and cfg.rebuild_src and cfg.no_analyze
+    assert cfg.concurrency == 5 and cfg.rate == 3.0
+    assert cfg.proxy.endswith("8080") and cfg.headers.get("A") == "B"
+    assert cfg.outdir == "out"
+    assert build_argparser().parse_args(["--check-deps"]).check_deps is True
+    assert _normalize_domain("https://sub.EXAMPLE.com/path?x=1") == "sub.example.com"
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
@@ -2040,16 +2112,67 @@ def cmd_check_deps() -> int:
     return 0
 
 
+def _normalize_domain(d: str) -> str:
+    d = d.strip()
+    if "://" in d:
+        d = urllib.parse.urlsplit(d).netloc or d
+    d = d.split("/")[0]
+    return d.lower().strip().strip(".")
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="godjs",
-        description="GodJS - hunt every JavaScript file for a domain.",
+        description="GodJS - hunt every JavaScript file for a domain (live, historical, hidden).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  python godjs.py example.com\n"
+               "  python godjs.py example.com --passive --validate\n"
+               "  python godjs.py example.com --no-subs --proxy http://127.0.0.1:8080\n"
+               "  python godjs.py --check-deps\n"
+               "  python godjs.py --selftest",
     )
     p.add_argument("domain", nargs="?", help="target domain, e.g. example.com")
-    p.add_argument("--selftest", nargs="?", const="", metavar="PATTERN",
-                   help="run built-in offline tests (optional substring filter) and exit")
-    p.add_argument("--check-deps", action="store_true",
-                   help="report available optional libs/tools and exit")
+    # scope & discovery
+    g1 = p.add_argument_group("scope & discovery")
+    g1.add_argument("--no-subs", action="store_true",
+                    help="exact host only (default: apex-scoped *.target.tld)")
+    g1.add_argument("--scope", metavar="FILE", help="explicit in-scope host list (one per line)")
+    g1.add_argument("--passive", action="store_true",
+                    help="passive archive sources only, no active crawl")
+    g1.add_argument("--depth", type=int, default=2, help="crawl depth (default 2)")
+    g1.add_argument("--max-urls", dest="max_urls", type=int, default=5000,
+                    help="hard cap on total candidates (default 5000)")
+    # analysis
+    g2 = p.add_argument_group("analysis")
+    g2.add_argument("--no-analyze", dest="no_analyze", action="store_true",
+                    help="skip secret/endpoint scan (discovery only)")
+    g2.add_argument("--validate", action="store_true",
+                    help="actively validate discovered secrets (opt-in; hits 3rd parties)")
+    g2.add_argument("--rebuild-src", dest="rebuild_src", action="store_true",
+                    help="write source-map original sources to disk")
+    # engine
+    g3 = p.add_argument_group("engine")
+    g3.add_argument("--concurrency", type=int, default=20, help="max in-flight requests (default 20)")
+    g3.add_argument("--rate", type=float, default=10.0, help="max req/sec per host (default 10)")
+    g3.add_argument("--timeout", type=float, default=15.0, help="per-request timeout s (default 15)")
+    g3.add_argument("--passive-timeout", dest="passive_timeout", type=float, default=45.0,
+                    help="overall wall-clock cap for passive providers (default 45)")
+    g3.add_argument("--proxy", help="route through a proxy, e.g. http://127.0.0.1:8080")
+    g3.add_argument("--header", action="append", metavar="'K: V'",
+                    help="extra header (repeatable; e.g. auth cookies)")
+    g3.add_argument("--ua", help="custom User-Agent")
+    # output & meta
+    g4 = p.add_argument_group("output & meta")
+    g4.add_argument("-o", "--out", dest="outdir", metavar="DIR",
+                    help="output dir (default ./godjs_out/DOMAIN)")
+    g4.add_argument("--json-only", dest="json_only", action="store_true",
+                    help="write only results.json")
+    g4.add_argument("-v", "--verbose", action="count", default=0, help="verbosity (-v, -vv)")
+    g4.add_argument("--check-deps", action="store_true",
+                    help="report available optional libs/tools and exit")
+    g4.add_argument("--selftest", nargs="?", const="", metavar="PATTERN",
+                    help="run built-in offline tests (optional substring filter) and exit")
     return p
 
 
@@ -2063,7 +2186,39 @@ def main(argv=None) -> int:
     if not ns.domain:
         build_argparser().print_help()
         return 2
-    print("[godjs] full run not wired yet (built incrementally); use --selftest for now")
+
+    cfg = Config.from_args(ns)
+    cfg.domain = _normalize_domain(cfg.domain)
+    if not cfg.domain:
+        print("error: could not parse a domain from input", file=sys.stderr)
+        return 2
+    cfg.outdir = cfg.outdir or str(Path("godjs_out") / cfg.domain)
+
+    print(f"[godjs] hunting JS for {cfg.domain}  "
+          f"(subs={'on' if cfg.allow_subs else 'off'}, "
+          f"passive={'yes' if cfg.passive else 'no'}, "
+          f"validate={'yes' if cfg.validate else 'no'}, backend={HttpEngine(cfg).backend})")
+    t0 = time.time()
+    try:
+        state = asyncio.run(Orchestrator(cfg).run())
+    except KeyboardInterrupt:
+        print("\n[godjs] interrupted", file=sys.stderr)
+        return 130
+    write_all(state, cfg.outdir)
+    dt = time.time() - t0
+    f = state.findings
+    print(f"[godjs] done in {dt:.1f}s: {len(state.records)} JS files, "
+          f"{f['files_with_secrets']} with secrets, {f['total_secrets']} secret candidates, "
+          f"{f['source_maps']} source maps, {f['total_endpoints']} endpoints")
+    print(f"[godjs] output -> {cfg.outdir}{os.sep}  (js_urls.txt, results.json"
+          f"{'' if cfg.json_only else ', report.html'})")
+    top = sorted([r for r in state.records if r.is_js and r.score > 0],
+                 key=lambda r: -r.score)[:10]
+    if top:
+        print("[godjs] top-scored files:")
+        for r in top:
+            tags = ",".join(sorted({s.type for s in r.secrets})) if r.secrets else ""
+            print(f"   {r.score:6.1f}  {r.url}  {tags}")
     return 0
 
 

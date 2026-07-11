@@ -37,11 +37,18 @@ pip install -r requirements.txt   # all optional
 python godjs.py example.com                 # full hunt (discovery + analysis)
 python godjs.py example.com --passive       # archives only, no active crawl
 python godjs.py example.com --no-subs       # exact host only
+python godjs.py example.com --scope scope.txt   # explicit in-scope host list
 python godjs.py example.com --validate      # actively prove discovered secrets (opt-in)
 python godjs.py example.com --rebuild-src   # write original source-map sources to disk
+python godjs.py example.com --proxy http://127.0.0.1:8080 --header 'Cookie: session=...'
 python godjs.py --check-deps                # what's available on this machine
-python godjs.py --selftest                  # run built-in offline tests
+python godjs.py --selftest                  # run built-in offline tests (21 checks)
+python godjs.py -h                          # all flags
 ```
+
+Every network phase is time-bounded: `--timeout` caps each request, `--passive-timeout`
+caps the whole passive-archive phase, and DNS-dead hosts are never retried — a slow or
+unreachable source can never stall the run.
 
 Output lands in `./godjs_out/<domain>/`:
 - `js_urls.txt` — clean, deduped, sorted URL list
