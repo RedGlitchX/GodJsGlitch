@@ -58,6 +58,7 @@ source .venv/bin/activate
 
 ```bash
 ./godjs.py example.com                 # full hunt (discovery + analysis)
+./godjs.py example.com --per-host      # hunt EVERY subdomain separately + a combined report
 ./godjs.py example.com --render        # headless browser: capture runtime-loaded JS (Network-tab parity)
 ./godjs.py example.com --validate      # actively prove discovered secrets (opt-in)
 ./godjs.py example.com --no-subs       # exact host only
@@ -81,6 +82,44 @@ Output lands in `./godjs_out/<domain>/`:
 - `js_urls.txt` — clean, deduped, sorted URL list
 - `results.json` — full per-file metadata + coverage summary
 - `report.html` — self-contained ranked report
+
+## Every subdomain, its own report: `--per-host`
+
+A default run shares one crawl budget across the whole apex, so on a large
+target (100+ subdomains) each host only gets a thin slice and quieter
+subdomains get starved. `--per-host` fixes that: it enumerates the apex
+(crt.sh + subfinder), does one apex-wide archive sweep, liveness-probes every
+candidate host, then **gives each reachable subdomain its own dedicated hunt**
+— so nothing gets missed because a noisier host ate the budget.
+
+```bash
+./godjs.py example.com --per-host --render --verbose
+./godjs.py example.com --per-host --host-concurrency 6   # hunt 6 hosts at a time
+```
+
+Output structure under `./godjs_out/<apex>/`:
+
+```
+godjs_out/example.com/
+├── index.html                     # dashboard: every subdomain, ranked, linked
+├── js_urls.txt                    # COMBINED deduped URL list (all hosts)
+├── results.json                   # COMBINED metadata + per-host coverage
+├── report.html                    # COMBINED ranked report
+├── unreachable_archived_js.txt    # archived JS on hosts that are now offline
+└── hosts/
+    ├── www.example.com/           # ← separate, self-contained report per subdomain
+    │   ├── js_urls.txt
+    │   ├── results.json
+    │   └── report.html
+    ├── docs.example.com/
+    │   └── ...
+    └── api.example.com/
+        └── ...
+```
+
+Connections are auto-scaled (`host_concurrency × per-host connections`) so
+running many hosts in parallel never starves any single one. Combine with
+`--render` to also capture each subdomain's runtime-loaded JS.
 
 ## Exact browser (DevTools Network tab) parity: `--render`
 

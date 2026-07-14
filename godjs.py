@@ -48,7 +48,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Optional
@@ -281,7 +281,15 @@ class Scope:
     allow_hosts: set = field(default_factory=set)
 
     def __post_init__(self):
-        self.apex = apex_of(self.apex)
+        # `apex` may arrive as a bare host, a subdomain, or a full URL. Remember the
+        # EXACT target host (so it is always in scope, even with allow_subs=False),
+        # then collapse to the registrable apex for subdomain matching.
+        raw = (self.apex or "").strip().lower()
+        if "://" in raw:
+            raw = raw.split("://", 1)[1]
+        raw = raw.split("/", 1)[0].split("@")[-1].split(":")[0].strip(".")
+        self.target = raw
+        self.apex = apex_of(raw)
         self.oos = {h.lower() for h in self.oos}
         self.allow_hosts = {h.lower().lstrip("*.") for h in self.allow_hosts}
 
@@ -294,7 +302,9 @@ class Scope:
             return False
         if self.allow_hosts:
             return any(host == h or host.endswith("." + h) for h in self.allow_hosts)
-        if host == self.apex:
+        # The exact target host is ALWAYS in scope, even a subdomain under --no-subs
+        # (otherwise a per-host hunt on `docs.example.com` excludes its own homepage).
+        if host == self.target or host == self.apex:
             return True
         if self.allow_subs and host.endswith("." + self.apex):
             return True
@@ -333,6 +343,14 @@ def _t_scope():
     s2 = Scope("example.com", allow_subs=False)
     assert not s2.in_scope("https://cdn.example.com/x.js")
     assert s2.in_scope("https://example.com/x.js")
+    # A subdomain target with --no-subs must include ITS OWN host (per-host mode).
+    s3 = Scope("docs.example.com", allow_subs=False)
+    assert s3.in_scope("https://docs.example.com/_static/app.js")   # own host
+    assert s3.in_scope("https://example.com/x.js")                  # apex (redirect target)
+    assert not s3.in_scope("https://cdn.example.com/x.js")          # sibling stays out
+    # Accepts a full URL / scheme as the target spec too.
+    s4 = Scope("https://api.example.com/", allow_subs=False)
+    assert s4.in_scope("https://api.example.com/v1/bundle.js")
     s.add_oos("cdn.example.com")
     assert not s.in_scope("https://cdn.example.com/x.js")
 
@@ -367,6 +385,10 @@ class Config:
     no_analyze: bool = False
     render: bool = False
     render_pages: int = 25
+    per_host: bool = False
+    host_concurrency: int = 4
+    skip_archives: bool = False
+    extra_candidates: list = field(default_factory=list)
     outdir: "Optional[str]" = None
     scope_file: "Optional[str]" = None
     json_only: bool = False
@@ -402,6 +424,8 @@ class Config:
             no_analyze=ns.no_analyze,
             render=ns.render,
             render_pages=ns.render_pages,
+            per_host=ns.per_host,
+            host_concurrency=ns.host_concurrency,
             outdir=ns.outdir,
             scope_file=ns.scope,
             json_only=ns.json_only,
@@ -2129,8 +2153,11 @@ class Orchestrator:
         # All providers run concurrently under one wall-clock budget: a slow or
         # hanging provider can never stall the run - we take whatever finished.
         # Providers return ALL urls; JS becomes a candidate, pages become crawl seeds.
+        # pre-seeded JS candidates (e.g. from an apex-level archive sweep in --per-host mode)
+        candidates |= {u for u in (cfg.extra_candidates or []) if scope.in_scope(u)}
+
         passive_pages: "set[str]" = set()
-        if not local:
+        if not local and not cfg.skip_archives:
             provs = [("wayback", source_wayback), ("otx", source_otx),
                      ("urlscan", source_urlscan), ("commoncrawl", source_commoncrawl),
                      ("crtsh", source_crtsh)]
@@ -2403,6 +2430,263 @@ def _t_render():
         assert js == set() and "not installed" in status
 
 
+# ----------------------------------------------------------------------------
+# SECTION: Per-host mode - dedicated hunt + report for EVERY subdomain,
+#          plus one combined report + an index. (--per-host)
+# ----------------------------------------------------------------------------
+def bucket_urls_by_host(urls) -> dict:
+    """Group a set of URLs by their hostname."""
+    out: dict = {}
+    for u in urls:
+        h = _host(u)
+        if h:
+            out.setdefault(h, set()).add(u)
+    return out
+
+
+def combine_states(apex: str, states: "list[RunState]", json_only: bool = False) -> RunState:
+    """Merge per-host RunStates into one combined RunState (dedup by URL)."""
+    records: "list[FileRecord]" = []
+    seen: set = set()
+    for st in states:
+        for r in st.records:
+            if r.url in seen:
+                continue
+            seen.add(r.url)
+            records.append(r)
+    sev: dict = {}
+    for r in records:
+        for s in (r.secrets or []):
+            sev[s.severity] = sev.get(s.severity, 0) + 1
+    findings = {
+        "secret_severity_counts": sev,
+        "files_with_secrets": sum(1 for r in records if r.secrets),
+        "total_secrets": sum(len(r.secrets or []) for r in records),
+        "total_endpoints": sum(len(r.endpoints or []) for r in records),
+        "source_maps": sum(1 for r in records if r.sourcemap_url),
+        "hosts": len(states),
+    }
+    coverage = {
+        "mode": "per-host",
+        "hosts_scanned": len(states),
+        "hosts_with_js": sum(1 for st in states if any(r.is_js for r in st.records)),
+        "total_js_files": sum(1 for r in records if r.is_js),
+    }
+    return RunState(apex, records, coverage, findings, json_only=json_only)
+
+
+def render_index_html(apex: str, summaries: "list[dict]") -> str:
+    """Index page linking every per-host report, ranked by JS count."""
+    rows = []
+    for s in sorted(summaries, key=lambda x: (-x["js"], x["host"])):
+        rows.append(
+            f"<tr><td class='h'><a href='hosts/{_esc(s['host'])}/report.html'>{_esc(s['host'])}</a></td>"
+            f"<td>{_esc(s['status'])}</td><td class='n'>{s['js']}</td>"
+            f"<td class='n'>{s['secrets']}</td><td class='n'>{s['endpoints']}</td></tr>")
+    tot_js = sum(s["js"] for s in summaries)
+    tot_sec = sum(s["secrets"] for s in summaries)
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GodJsGlitch - {_esc(apex)} (per-host)</title>
+<style>
+:root{{color-scheme:light dark}}
+body{{font-family:system-ui,Segoe UI,Roboto,sans-serif;margin:0;background:#0d0d10;color:#e8e8ea}}
+header{{padding:20px 24px;background:#15151a;border-bottom:1px solid #2a2a33}}
+h1{{margin:0;font-size:20px}} .sub{{color:#9a9aa5;font-size:13px;margin-top:4px}}
+.wrap{{padding:20px 24px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid #23232b}}
+th{{background:#15151a;color:#9a9aa5}} td.n{{text-align:right;font-variant-numeric:tabular-nums}}
+td.h{{word-break:break-all}} a{{color:#7aa2ff;text-decoration:none}}
+@media (prefers-color-scheme:light){{body{{background:#fff;color:#111}}header,th{{background:#f6f6f8}}}}
+</style></head><body>
+<header><h1>GodJsGlitch &mdash; {_esc(apex)}</h1>
+<div class="sub">per-host scan &middot; {len(summaries)} subdomains &middot; {tot_js} JS files &middot; {tot_sec} secret candidates
+&middot; combined report: <a href="report.html">report.html</a> &middot; all URLs: <a href="js_urls.txt">js_urls.txt</a></div></header>
+<div class="wrap"><table>
+<thead><tr><th>Subdomain</th><th>Status</th><th>JS files</th><th>Secrets</th><th>Endpoints</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table></div></body></html>"""
+
+
+async def _sweep_wayback(engine: HttpEngine, apex: str) -> "set[str]":
+    url = (f"http://web.archive.org/cdx/search/cdx?url=*.{apex}/*"
+           f"&output=text&fl=original&collapse=urlkey&limit=100000")
+    r = await _get_resilient(engine, url)
+    return parse_wayback_cdx(r.text) if (not r.error and r.text) else set()
+
+
+async def _sweep_commoncrawl(engine: HttpEngine, apex: str) -> "set[str]":
+    r = await _get_resilient(engine, "https://index.commoncrawl.org/collinfo.json")
+    if r.error or r.status != 200 or not r.text:
+        return set()
+    try:
+        idx = json.loads(r.text)
+    except Exception:
+        return set()
+    if not idx or not isinstance(idx, list) or not idx[0].get("cdx-api"):
+        return set()
+    r2 = await _get_resilient(engine, f"{idx[0]['cdx-api']}?url=*.{apex}&output=json&fl=url&limit=100000")
+    return parse_commoncrawl(r2.text) if (not r2.error and r2.text) else set()
+
+
+async def apex_passive_sweep(engine: HttpEngine, apex: str, budget: float) -> "set[str]":
+    """Query archives domain-wide (all subdomains) once, return every URL."""
+    provs = {
+        asyncio.ensure_future(_sweep_wayback(engine, apex)): "wayback",
+        asyncio.ensure_future(source_otx(engine, apex)): "otx",
+        asyncio.ensure_future(source_urlscan(engine, apex)): "urlscan",
+        asyncio.ensure_future(_sweep_commoncrawl(engine, apex)): "commoncrawl",
+    }
+    done, pending = await asyncio.wait(list(provs.keys()), timeout=budget)
+    for t in pending:
+        t.cancel()
+    out: "set[str]" = set()
+    for t in done:
+        try:
+            res = t.result()
+        except Exception:
+            res = set()
+        out |= res.urls if isinstance(res, SourceResult) else (res if isinstance(res, set) else set())
+    return out
+
+
+async def enumerate_subdomains(engine: HttpEngine, apex: str, scope: Scope) -> "set[str]":
+    """crt.sh + subfinder + apex + www -> in-scope hostnames."""
+    hosts: "set[str]" = {apex, "www." + apex}
+    try:
+        cr = await source_crtsh(engine, apex)
+        hosts |= cr.urls
+    except Exception:
+        pass
+    try:
+        hosts |= await bridge_subdomains(apex, scope)
+    except Exception:
+        pass
+    return {h for h in hosts if scope.in_scope("https://" + h + "/")}
+
+
+async def live_hosts(engine: HttpEngine, hosts: "set[str]") -> dict:
+    """Probe each host root; return {host: (status, scheme)} for reachable ones."""
+    async def probe(h):
+        for scheme in ("https", "http"):
+            r = await engine.get(f"{scheme}://{h}/")
+            if not r.error and r.status:
+                return h, r.status, scheme
+        return h, None, None
+    results = await asyncio.gather(*[probe(h) for h in hosts], return_exceptions=True)
+    alive: dict = {}
+    for res in results:
+        if isinstance(res, Exception):
+            continue
+        h, status, scheme = res
+        if status:
+            alive[h] = (status, scheme)
+    return alive
+
+
+async def run_per_host(cfg: Config) -> RunState:
+    """Enumerate subdomains, hunt each one independently, write per-host + combined reports."""
+    apex = apex_of(cfg.domain)
+    scope = Scope(apex, allow_subs=True)
+    apex_out = Path(cfg.outdir)
+    engine = HttpEngine(cfg)
+
+    hosts = await enumerate_subdomains(engine, apex, scope)
+    _vlog(cfg, f"per-host: {len(hosts)} subdomains from crt.sh/subfinder")
+
+    sweep = set()
+    if not cfg.skip_archives:
+        _vlog(cfg, "per-host: apex-wide archive sweep (Wayback/OTX/URLScan/CommonCrawl)...")
+        sweep = await apex_passive_sweep(engine, apex, cfg.passive_budget)
+    buckets = bucket_urls_by_host(sweep)
+
+    candidate_hosts = hosts | {h for h in buckets if scope.in_scope("https://" + h + "/")}
+    _vlog(cfg, f"per-host: {len(candidate_hosts)} candidate hosts "
+               f"({len(hosts)} enumerated + {len(buckets)} seen in archives); probing liveness...")
+    alive = await live_hosts(engine, candidate_hosts)
+    # dead hosts that had archived JS: keep those URLs for the combined list (unreachable-but-known)
+    dead_archive_js = sorted({
+        u for h, b in buckets.items() if h not in alive
+        for u in b if looks_like_js_url(u) and scope.in_scope(u)})
+    await engine.close()
+    targets = set(alive) or {apex}
+    # Scale connections-per-host so total (~host_concurrency * per_host) stays reasonable.
+    per_host_conc = max(3, cfg.concurrency // max(1, cfg.host_concurrency))
+    _vlog(cfg, f"per-host: {len(targets)} reachable; hunting with {cfg.host_concurrency} hosts "
+               f"in parallel, {per_host_conc} connections each "
+               f"({len(dead_archive_js)} archived JS on unreachable hosts kept)")
+
+    sem = asyncio.Semaphore(max(1, cfg.host_concurrency))
+    summaries: "list[dict]" = []
+    states: "list[RunState]" = []
+
+    async def hunt(h: str):
+        async with sem:
+            bucket = buckets.get(h, set())
+            bjs = [u for u in bucket if looks_like_js_url(u)]
+            bpages = [u for u in bucket if not looks_like_js_url(u) and _is_page(u)]
+            hcfg = replace(
+                cfg, domain=h, allow_subs=False, per_host=False, skip_archives=True,
+                passive=False, extra_candidates=list(bjs),
+                seeds=[f"https://{h}/", f"http://{h}/"] + bpages[:200],
+                outdir=str(apex_out / "hosts" / h),
+                concurrency=per_host_conc,
+                max_pages=min(cfg.max_pages, 150), verbose=0)
+            try:
+                st = await Orchestrator(hcfg).run()
+            except Exception:
+                return None
+            write_all(st, hcfg.outdir)
+            njs = sum(1 for r in st.records if r.is_js)
+            status = f"{alive.get(h, ('?',))[0]}" if h in alive else "archive-only"
+            _vlog(cfg, f"per-host {h}: {njs} JS, {st.findings['total_secrets']} secrets")
+            return st, {
+                "host": h, "status": status, "js": njs,
+                "secrets": st.findings["total_secrets"],
+                "endpoints": st.findings["total_endpoints"],
+            }
+
+    results = await asyncio.gather(*[hunt(h) for h in sorted(targets)], return_exceptions=True)
+    for res in results:
+        if isinstance(res, Exception) or res is None:
+            continue
+        st, summary = res
+        states.append(st)
+        summaries.append(summary)
+
+    combined = combine_states(apex, states, json_only=cfg.json_only)
+    write_all(combined, apex_out)
+    try:
+        (apex_out / "index.html").write_text(render_index_html(apex, summaries), encoding="utf-8")
+    except Exception:
+        pass
+    if dead_archive_js:
+        try:
+            (apex_out / "unreachable_archived_js.txt").write_text(
+                "\n".join(dead_archive_js) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+    return combined
+
+
+@selftest("perhost.helpers")
+def _t_perhost():
+    b = bucket_urls_by_host({"https://a.x.com/1.js", "https://a.x.com/2.js", "https://b.x.com/3.js"})
+    assert b["a.x.com"] == {"https://a.x.com/1.js", "https://a.x.com/2.js"}
+    assert b["b.x.com"] == {"https://b.x.com/3.js"}
+    s1 = RunState("a.x.com", [FileRecord("https://a.x.com/1.js", set(), 200, "application/javascript",
+                  9, "h1", True, "", secrets=[Secret("t", "m", 4.0, "high")])], {}, {})
+    s2 = RunState("b.x.com", [FileRecord("https://b.x.com/3.js", set(), 200, "application/javascript",
+                  9, "h3", True, "")], {}, {})
+    comb = combine_states("x.com", [s1, s2])
+    assert len(comb.records) == 2 and comb.findings["total_secrets"] == 1
+    assert comb.coverage["hosts_scanned"] == 2 and comb.coverage["total_js_files"] == 2
+    html = render_index_html("x.com", [
+        {"host": "a.x.com", "status": "200", "js": 2, "secrets": 1, "endpoints": 5},
+        {"host": "b.x.com", "status": "200", "js": 1, "secrets": 0, "endpoints": 0}])
+    assert "a.x.com/report.html" in html and "x.com" in html
+
+
 # @@INSERT_SECTIONS_ABOVE@@
 
 
@@ -2457,6 +2741,11 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="hard cap on total candidates (default 5000)")
     g1.add_argument("--max-pages", dest="max_pages", type=int, default=300,
                     help="max HTML pages to crawl, e.g. subdomain homepages (default 300)")
+    g1.add_argument("--per-host", dest="per_host", action="store_true",
+                    help="run a dedicated hunt for EVERY subdomain and write a separate "
+                         "report per subdomain PLUS a combined report + index.html")
+    g1.add_argument("--host-concurrency", dest="host_concurrency", type=int, default=4,
+                    help="how many subdomains to hunt in parallel in --per-host mode (default 4)")
     # analysis
     g2 = p.add_argument_group("analysis")
     g2.add_argument("--no-analyze", dest="no_analyze", action="store_true",
@@ -2513,17 +2802,21 @@ def main(argv=None) -> int:
         return 2
     cfg.outdir = cfg.outdir or str(Path("godjs_out") / cfg.domain)
 
+    mode = "per-host" if cfg.per_host else ("passive" if cfg.passive else "full")
     print(f"[godjsglitch] hunting JS for {cfg.domain}  "
-          f"(subs={'on' if cfg.allow_subs else 'off'}, "
-          f"passive={'yes' if cfg.passive else 'no'}, "
+          f"(mode={mode}, subs={'on' if cfg.allow_subs else 'off'}, "
+          f"render={'yes' if cfg.render else 'no'}, "
           f"validate={'yes' if cfg.validate else 'no'}, backend={HttpEngine(cfg).backend})")
     t0 = time.time()
     try:
-        state = asyncio.run(Orchestrator(cfg).run())
+        if cfg.per_host:
+            state = asyncio.run(run_per_host(cfg))
+        else:
+            state = asyncio.run(Orchestrator(cfg).run())
+            write_all(state, cfg.outdir)
     except KeyboardInterrupt:
         print("\n[godjsglitch] interrupted", file=sys.stderr)
         return 130
-    write_all(state, cfg.outdir)
     dt = time.time() - t0
     f = state.findings
     n = len([r for r in state.records if r.is_js])
@@ -2532,6 +2825,11 @@ def main(argv=None) -> int:
           f"{f['source_maps']} source maps, {f['total_endpoints']} endpoints")
     print(f"[godjsglitch] output -> {cfg.outdir}{os.sep}  (js_urls.txt, results.json"
           f"{'' if cfg.json_only else ', report.html'})")
+    if cfg.per_host:
+        print(f"[godjsglitch] per-host: {state.coverage.get('hosts_scanned', 0)} subdomains scanned, "
+              f"{state.coverage.get('hosts_with_js', 0)} served JS")
+        print(f"[godjsglitch]   - per-subdomain reports: {cfg.outdir}{os.sep}hosts{os.sep}<host>{os.sep}")
+        print(f"[godjsglitch]   - combined report + index: {cfg.outdir}{os.sep}index.html")
     top = sorted([r for r in state.records if r.is_js and r.score > 0],
                  key=lambda r: -r.score)[:10]
     if top:
